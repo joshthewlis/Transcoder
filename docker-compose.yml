@@ -1,0 +1,51 @@
+services:
+  transcoder-server:
+    build:
+      context: .
+      dockerfile: docker/server/Dockerfile
+    container_name: transcoder-server
+    ports:
+      - "5000:5000"
+    environment:
+      ConnectionStrings__Transcoder: Data Source=/app/data/transcoder.db
+      Transcoder__Security__AdminApiKey: dev-admin-key
+      Transcoder__Security__WorkerApiKey: dev-worker-key
+      Transcoder__Storage__TranscoderRoot: /mnt/.transcoder
+      Transcoder__Storage__WorkingRoot: /mnt/.transcoder/working
+      Transcoder__Storage__StagingRoot: /mnt/.transcoder/staging
+      Transcoder__ActiveHours__Enabled: "true"
+      Transcoder__ActiveHours__TimeZoneId: Europe/London
+      Transcoder__ActiveHours__Start: "08:30"
+      Transcoder__ActiveHours__Stop: "02:00"
+      Transcoder__ActiveHours__StopNewWorkMinutesBefore: "30"
+    volumes:
+      - ./app-data/server:/app/data
+      - /mnt:/mnt
+
+  transcoder-worker-probe:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    container_name: transcoder-worker-probe
+    depends_on:
+      - transcoder-server
+    environment:
+      Transcoder__ServerUrl: http://transcoder-server:5000
+      Transcoder__ApiKey: dev-worker-key
+      Transcoder__WorkerId: probe-worker-1
+      Transcoder__WorkerName: Probe Worker 1
+      Transcoder__Roles: Prober
+      Transcoder__Limits__MaxProbeJobs: 10
+      Transcoder__Limits__MaxPlanReviewJobs: 10
+      Transcoder__Limits__MaxTranscodeJobs: 0
+      Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__LocalWorkingRoot: /work/transcoder
+      Transcoder__AutoCreateLocalWorkingRoot: "true"
+      Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
+      Transcoder__PathMappings__0__ServerPrefix: /mnt/movies
+      Transcoder__PathMappings__0__WorkerPrefix: /mnt/movies
+      Transcoder__PathMappings__1__ServerPrefix: /mnt/.transcoder
+      Transcoder__PathMappings__1__WorkerPrefix: /mnt/.transcoder
+    volumes:
+      - /mnt:/mnt
+      - ./app-data/worker-probe:/work/transcoder

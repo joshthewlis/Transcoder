@@ -1,0 +1,28 @@
+[
+  {
+    "Name": "Server + Worker",
+    "Projects": [
+      {
+        "Path": "src\\Transcoder.Server\\Transcoder.Server.csproj",
+        "Action": "Start"
+      },
+      {
+        "Path": "src\\Transcoder.Worker\\Transcoder.Worker.csproj",
+        "Action": "Start"
+      }
+    ]
+  },
+  {
+    "Name": "Server Only",
+    "Projects": [
+      {
+        "Path": "src\\Transcoder.Server\\Transcoder.Server.csproj",
+        "Action": "Start"
+      },
+      {
+        "Path": "src\\Transcoder.Worker\\Transcoder.Worker.csproj",
+        "Action": "None"
+      }
+    ]
+  }
+]

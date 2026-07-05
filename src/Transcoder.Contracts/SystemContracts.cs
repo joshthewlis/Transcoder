@@ -1,0 +1,66 @@
+namespace Transcoder.Contracts;
+
+public sealed record SystemStatusDto(
+    string ServerVersion,
+    string ApiVersion,
+    ProcessingMode ProcessingMode,
+    string DatabaseProvider,
+    int WorkersOnline,
+    int WorkersUnresponsive,
+    int WorkersLost,
+    int QueuedJobs,
+    int RunningJobs,
+    int NeedsReview,
+    bool AutoQueueCleanupJobs,
+    bool AutoQueueTranscodeJobs,
+    bool RequirePlanReviewBeforeAutoQueue,
+    ActiveHoursStatusDto ActiveHours,
+    long TotalActualSavedBytes,
+    int CompletedCleanupCount,
+    int CompletedTranscodeCount);
+
+public sealed record SetProcessingModeRequest(ProcessingMode ProcessingMode);
+
+
+public sealed class ExecutionSettingsDto
+{
+    public bool AutoQueueCleanupJobs { get; set; }
+    public bool AutoQueueTranscodeJobs { get; set; }
+    public bool RequirePlanReviewBeforeAutoQueue { get; set; } = true;
+
+    // v31 active-hours gate for long staged work. Defaults match a NAS that is off 02:00-08:00.
+    public bool ActiveHoursEnabled { get; set; } = true;
+    public string ActiveHoursTimeZoneId { get; set; } = "Europe/London";
+    public string ActiveHoursStart { get; set; } = "08:30";
+    public string ActiveHoursStop { get; set; } = "02:00";
+    public int StopNewWorkMinutesBefore { get; set; } = 30;
+}
+
+
+public sealed class ActiveHoursStatusDto
+{
+    public bool Enabled { get; set; }
+    public string TimeZoneId { get; set; } = "Europe/London";
+    public string Start { get; set; } = "08:30";
+    public string Stop { get; set; } = "02:00";
+    public int StopNewWorkMinutesBefore { get; set; } = 30;
+    public bool AllowStagedWork { get; set; } = true;
+    public string LocalNow { get; set; } = string.Empty;
+    public DateTime UtcNow { get; set; }
+    public DateTime? NextStartUtc { get; set; }
+    public DateTime? StopNewWorkUtc { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+
+
+public sealed class AutomationReconciliationResultDto
+{
+    public int Considered { get; set; }
+    public int QueuedCleanup { get; set; }
+    public int QueuedTranscode { get; set; }
+    public int AlreadyQueued { get; set; }
+    public int Skipped { get; set; }
+    public bool ActiveHoursPaused { get; set; }
+    public ActiveHoursStatusDto? ActiveHours { get; set; }
+    public List<string> Messages { get; set; } = [];
+}

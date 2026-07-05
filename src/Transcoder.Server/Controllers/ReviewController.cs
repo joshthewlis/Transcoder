@@ -1,0 +1,84 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Transcoder.Contracts;
+using Transcoder.Server.Data;
+using Transcoder.Server.Data.Entities;
+
+namespace Transcoder.Server.Controllers;
+
+[ApiController]
+[Route("api/review")]
+public sealed class ReviewController(TranscoderDbContext db) : ControllerBase
+{
+    [HttpGet]
+    public async Task<ActionResult<PagedResultDto<ReviewItemDto>>> List([FromQuery] int page = 1, [FromQuery] int pageSize = 100, CancellationToken cancellationToken = default)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 500);
+        var query = db.ReviewItems.AsNoTracking().Where(x => !x.Resolved);
+        var total = await query.CountAsync(cancellationToken);
+        var items = await query.OrderByDescending(x => x.CreatedUtc).Skip((page - 1) * pageSize).Take(pageSize).ToListAsync(cancellationToken);
+        var mediaIds = items.Select(x => x.MediaItemId).Distinct().ToList();
+        var mediaById = await db.MediaItems.AsNoTracking()
+            .Include(x => x.Library)
+            .Where(x => mediaIds.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, cancellationToken);
+        return new PagedResultDto<ReviewItemDto> { Items = items.Select(x => ToDto(x, mediaById.TryGetValue(x.MediaItemId, out var media) ? media : null)).ToList(), Page = page, PageSize = pageSize, TotalCount = total };
+    }
+
+    [HttpGet("{reviewId:long}")]
+    public async Task<ActionResult<ReviewItemDto>> Get(long reviewId, CancellationToken cancellationToken)
+    {
+        var item = await db.ReviewItems.AsNoTracking().FirstOrDefaultAsync(x => x.Id == reviewId, cancellationToken);
+        if (item is null) return NotFound();
+        var media = await db.MediaItems.AsNoTracking().Include(x => x.Library).FirstOrDefaultAsync(x => x.Id == item.MediaItemId, cancellationToken);
+        return ToDto(item, media);
+    }
+
+    [HttpPost("{reviewId:long}/approve")]
+    public async Task<IActionResult> Approve(long reviewId, CancellationToken cancellationToken)
+    {
+        var item = await db.ReviewItems.FirstOrDefaultAsync(x => x.Id == reviewId, cancellationToken);
+        if (item is null) return NotFound();
+        item.Resolved = true;
+        item.ResolvedUtc = DateTime.UtcNow;
+        var media = await db.MediaItems.FirstOrDefaultAsync(x => x.Id == item.MediaItemId, cancellationToken);
+        if (media is not null && !string.IsNullOrWhiteSpace(media.PlanJson))
+            media.Status = MediaStatus.ReadyToTranscode;
+        await db.SaveChangesAsync(cancellationToken);
+        return NoContent();
+    }
+
+    [HttpPost("{reviewId:long}/skip")]
+    public async Task<IActionResult> Skip(long reviewId, CancellationToken cancellationToken)
+    {
+        var item = await db.ReviewItems.FirstOrDefaultAsync(x => x.Id == reviewId, cancellationToken);
+        if (item is null) return NotFound();
+        var media = await db.MediaItems.FirstOrDefaultAsync(x => x.Id == item.MediaItemId, cancellationToken);
+        if (media is not null) media.Status = MediaStatus.Skipped;
+        item.Resolved = true;
+        item.ResolvedUtc = DateTime.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+        return NoContent();
+    }
+
+    [HttpPost("{reviewId:long}/stream-actions")]
+    public IActionResult StreamActions(long reviewId) => Accepted(new { reviewId, message = "Manual stream action support is reserved for the planner implementation pass." });
+
+    private static ReviewItemDto ToDto(ReviewItemEntity item, MediaItemEntity? media) => new()
+    {
+        Id = item.Id,
+        MediaItemId = item.MediaItemId,
+        LibraryId = media?.LibraryId,
+        LibraryName = media?.Library?.Name,
+        MediaName = media is null ? null : Path.GetFileName(media.RelativePath),
+        MediaRelativePath = media?.RelativePath,
+        MediaFullPath = media?.FullPath,
+        ReviewType = item.ReviewType,
+        Severity = item.Severity,
+        Reason = item.Reason,
+        DetailsJson = item.DetailsJson,
+        Resolved = item.Resolved,
+        CreatedUtc = item.CreatedUtc
+    };
+}

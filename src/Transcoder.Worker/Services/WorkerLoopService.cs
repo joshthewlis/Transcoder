@@ -1,0 +1,729 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Options;
+using Transcoder.Contracts;
+using Transcoder.Worker.Configuration;
+
+namespace Transcoder.Worker.Services;
+
+public sealed class WorkerLoopService(
+    IOptions<WorkerOptions> options,
+    WorkerApiClient api,
+    CapabilityDetector capabilities,
+    PathMapper pathMapper,
+    FfprobeRunner ffprobe,
+    FfmpegRunner ffmpeg,
+    ShutdownService shutdown,
+    ILogger<WorkerLoopService> logger) : BackgroundService
+{
+    private readonly WorkerOptions _options = options.Value;
+    private readonly string _instanceId = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}"[..24];
+    private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() }
+    };
+
+    private WorkerCapabilitiesDto _capabilities = new();
+    private WorkerControlState _controlState = WorkerControlState.Normal;
+    private int _pollSeconds = 10;
+    private DateTime? _idleSinceUtc;
+    private readonly ConcurrentDictionary<long, ActiveJobState> _activeJobs = new();
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _capabilities = await capabilities.DetectAsync(stoppingToken);
+        var requirementErrors = capabilities.ValidateLocalRequirements(_capabilities);
+        if (requirementErrors.Count > 0)
+        {
+            foreach (var error in requirementErrors)
+                logger.LogError("Worker requirement failed: {Error}", error);
+
+            if (_options.StopIfRequiredToolsMissing)
+            {
+                logger.LogCritical("Worker will not register because required local tools are missing. Set Transcoder:StopIfRequiredToolsMissing=false to allow the server to reject/register it as degraded instead.");
+                return;
+            }
+        }
+
+        var registerResponse = await RegisterAsync(stoppingToken);
+        if (!registerResponse.Accepted)
+        {
+            logger.LogCritical("Server rejected worker registration: {Message}. Errors: {Errors}", registerResponse.Message, string.Join(" | ", registerResponse.RequirementErrors));
+            return;
+        }
+
+        _pollSeconds = registerResponse.PollSeconds <= 0 ? 10 : registerResponse.PollSeconds;
+        _controlState = registerResponse.ControlState;
+
+        if (await ApplyRuntimeSettingsAsync(stoppingToken))
+            registerResponse.PathCheckRequired = true;
+
+        if (registerResponse.PathCheckRequired)
+            await RunPathChecksAsync(registerResponse.PathChecks, stoppingToken);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var heartbeat = await SendHeartbeatAsync(stoppingToken);
+            _controlState = heartbeat.ControlState;
+
+            if (await ApplyRuntimeSettingsAsync(stoppingToken))
+                heartbeat.PathCheckRequired = true;
+
+            if (heartbeat.PathCheckRequired)
+                await RunPathChecksAsync(heartbeat.PathChecks, stoppingToken);
+
+            if (heartbeat.AcceptNewWork && _controlState == WorkerControlState.Normal)
+            {
+                var leaseResponse = await RequestAndStartWorkAsync(stoppingToken);
+                _controlState = leaseResponse.ControlState;
+                if (leaseResponse.RetryAfterSeconds > 0)
+                    _pollSeconds = leaseResponse.RetryAfterSeconds;
+
+                if (leaseResponse.PathCheckRequired)
+                    await RunPathChecksAsync(leaseResponse.PathChecks, stoppingToken);
+
+                TrackIdleState(leaseResponse.Leases.Count == 0 && _activeJobs.IsEmpty, leaseResponse.ControlState, stoppingToken);
+            }
+            else
+            {
+                TrackIdleState(_activeJobs.IsEmpty, _controlState, stoppingToken);
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(_pollSeconds), stoppingToken);
+        }
+    }
+
+    private async Task<bool> ApplyRuntimeSettingsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var runtime = await api.GetRuntimeSettingsAsync(_options.WorkerId, cancellationToken);
+            if (runtime is null)
+                return false;
+            if (runtime.UpdatedUtc == DateTime.MinValue && runtime.PathMappings.Count == 0)
+                return false;
+
+            return pathMapper.ApplyRuntimeSettings(runtime);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not apply runtime worker settings from server.");
+            return false;
+        }
+    }
+
+    private async Task<WorkerRegisterResponse> RegisterAsync(CancellationToken cancellationToken)
+    {
+        var request = new WorkerRegisterRequest
+        {
+            WorkerId = _options.WorkerId,
+            WorkerName = _options.WorkerName,
+            WorkerInstanceId = _instanceId,
+            WorkerVersion = typeof(WorkerLoopService).Assembly.GetName().Version?.ToString() ?? "0.0.0",
+            Roles = _options.Roles,
+            Capabilities = _capabilities,
+            Limits = _options.Limits,
+            PathMapping = new WorkerPathMappingSummaryDto
+            {
+                MappingConfigHash = pathMapper.MappingConfigHash,
+                ServerPrefixes = pathMapper.ServerPrefixes.ToList()
+            },
+            LocalStorage = CheckLocalWorkingRoot(),
+            Shutdown = new WorkerShutdownCapabilitiesDto
+            {
+                SupportsExitOnly = true,
+                SupportsShutdown = !string.IsNullOrWhiteSpace(_options.Shutdown.ShutdownCommand),
+                AllowRemoteExitRequest = _options.Shutdown.AllowRemoteExitRequest,
+                AllowRemoteShutdownRequest = _options.Shutdown.AllowRemoteShutdownRequest
+            }
+        };
+
+        logger.LogInformation("Registering worker {WorkerId} instance {InstanceId}", _options.WorkerId, _instanceId);
+        return await api.RegisterAsync(request, cancellationToken);
+    }
+
+    private WorkerLocalStorageDto CheckLocalWorkingRoot()
+    {
+        try
+        {
+            var path = _options.LocalWorkingRoot;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return new WorkerLocalStorageDto
+                {
+                    WorkingMode = _options.TranscodeWorkingMode,
+                    Error = "LocalWorkingRoot is not configured."
+                };
+            }
+
+            var created = false;
+            var exists = Directory.Exists(path);
+            if (!exists && _options.AutoCreateLocalWorkingRoot)
+            {
+                var parent = Directory.GetParent(path);
+                if (parent is not null && parent.Exists)
+                {
+                    Directory.CreateDirectory(path);
+                    created = true;
+                    exists = true;
+                }
+            }
+
+            var writable = exists && CanWrite(path);
+            return new WorkerLocalStorageDto
+            {
+                WorkingMode = _options.TranscodeWorkingMode,
+                LocalWorkingRootExists = exists,
+                LocalWorkingRootWritable = writable,
+                LocalWorkingRootCreated = created,
+                Error = writable ? null : $"Local working root failed checks. Exists={exists}, CanWrite={writable}, AutoCreate={_options.AutoCreateLocalWorkingRoot}"
+            };
+        }
+        catch (Exception ex)
+        {
+            return new WorkerLocalStorageDto
+            {
+                WorkingMode = _options.TranscodeWorkingMode,
+                Error = ex.Message
+            };
+        }
+    }
+
+    private async Task RunPathChecksAsync(List<PathCheckDefinitionDto> checks, CancellationToken cancellationToken)
+    {
+        var results = new List<WorkerPathCheckResultDto>();
+        foreach (var check in checks)
+        {
+            results.Add(RunPathCheck(check));
+        }
+
+        await api.SendPathChecksAsync(_options.WorkerId, new WorkerPathCheckResultsRequest
+        {
+            WorkerInstanceId = _instanceId,
+            MappingConfigHash = pathMapper.MappingConfigHash,
+            Results = results
+        }, cancellationToken);
+    }
+
+    private WorkerPathCheckResultDto RunPathCheck(PathCheckDefinitionDto check)
+    {
+        if (!pathMapper.TryMap(check.ServerPath, out var localPath))
+        {
+            return new WorkerPathCheckResultDto
+            {
+                Id = check.Id,
+                LibraryId = check.LibraryId,
+                ServerPath = check.ServerPath,
+                Success = false,
+                Error = "No worker path mapping matched the server path."
+            };
+        }
+
+        try
+        {
+            var created = false;
+            var exists = Directory.Exists(localPath) || File.Exists(localPath);
+
+            if (!exists && check.AllowCreateIfMissing)
+            {
+                var parent = Directory.GetParent(localPath);
+                if (parent is not null && parent.Exists)
+                {
+                    Directory.CreateDirectory(localPath);
+                    created = true;
+                    exists = true;
+                }
+            }
+
+            var canRead = exists && CanRead(localPath);
+            var canWrite = exists && (!check.MustBeWritable || CanWrite(localPath));
+            var success = (!check.MustExist || exists) && (!check.MustBeReadable || canRead) && (!check.MustBeWritable || canWrite);
+            return new WorkerPathCheckResultDto
+            {
+                Id = check.Id,
+                LibraryId = check.LibraryId,
+                ServerPath = check.ServerPath,
+                Success = success,
+                CanRead = canRead,
+                CanWrite = canWrite,
+                Created = created,
+                Error = success ? null : $"Mapped path failed checks. Exists={exists}, CanRead={canRead}, CanWrite={canWrite}, AllowCreateIfMissing={check.AllowCreateIfMissing}"
+            };
+        }
+        catch (Exception ex)
+        {
+            return new WorkerPathCheckResultDto
+            {
+                Id = check.Id,
+                LibraryId = check.LibraryId,
+                ServerPath = check.ServerPath,
+                Success = false,
+                Error = ex.Message
+            };
+        }
+    }
+
+    private static bool CanRead(string path)
+    {
+        if (File.Exists(path))
+        {
+            using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return stream.CanRead;
+        }
+
+        Directory.EnumerateFileSystemEntries(path).Take(1).ToList();
+        return true;
+    }
+
+    private static bool CanWrite(string path)
+    {
+        var directory = Directory.Exists(path) ? path : Path.GetDirectoryName(path);
+        if (string.IsNullOrWhiteSpace(directory)) return false;
+        var testPath = Path.Combine(directory, $".transcoder-write-test-{Guid.NewGuid():N}");
+        File.WriteAllText(testPath, "test");
+        File.Delete(testPath);
+        return true;
+    }
+
+    private async Task<WorkerHeartbeatResponse> SendHeartbeatAsync(CancellationToken cancellationToken)
+    {
+        return await api.HeartbeatAsync(_options.WorkerId, new WorkerHeartbeatRequest
+        {
+            WorkerInstanceId = _instanceId,
+            ActiveJobs = _activeJobs.Values.Select(job => new ActiveJobHeartbeatDto
+            {
+                JobId = job.JobId,
+                LeaseId = job.LeaseId,
+                JobType = job.JobType,
+                Progress = job.Progress,
+                Message = job.Message,
+                Fps = job.Fps,
+                EtaSeconds = job.EtaSeconds
+            }).ToList(),
+            AvailableCapacity = BuildAvailableCapacity()
+        }, cancellationToken);
+    }
+
+    private async Task<JobLeaseBatchResponse> RequestAndStartWorkAsync(CancellationToken cancellationToken)
+    {
+        var request = new LeaseBatchRequest
+        {
+            WorkerId = _options.WorkerId,
+            WorkerInstanceId = _instanceId,
+            Capabilities = _capabilities,
+            Requests = BuildLeaseRequests()
+        };
+
+        var response = await api.LeaseBatchAsync(request, cancellationToken);
+        foreach (var lease in response.Leases)
+        {
+            var active = new ActiveJobState
+            {
+                JobId = lease.JobId,
+                LeaseId = lease.LeaseId,
+                JobType = lease.JobType,
+                Progress = 0,
+                Message = $"Starting {lease.JobType}"
+            };
+
+            if (!_activeJobs.TryAdd(lease.JobId, active))
+                continue;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunJobAsync(lease, cancellationToken);
+                }
+                finally
+                {
+                    _activeJobs.TryRemove(lease.JobId, out _);
+                }
+            }, cancellationToken);
+        }
+
+        return response;
+    }
+
+    private WorkerCapacityDto BuildAvailableCapacity() => new()
+    {
+        Probe = Math.Max(0, _options.Limits.MaxProbeJobs - CountActive(JobType.Probe)),
+        PlanReview = Math.Max(0, _options.Limits.MaxPlanReviewJobs - CountActive(JobType.PlanReview)),
+        Cleanup = Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup)),
+        Transcode = Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode)),
+        Validation = Math.Max(0, _options.Limits.MaxValidationJobs - CountActive(JobType.ValidateOutput))
+    };
+
+    private int CountActive(JobType jobType) => _activeJobs.Values.Count(x => x.JobType == jobType);
+
+    private List<JobLeaseRequestItemDto> BuildLeaseRequests()
+    {
+        var capacity = BuildAvailableCapacity();
+        var requests = new List<JobLeaseRequestItemDto>();
+        if (_options.Roles.HasFlag(WorkerRole.Prober))
+        {
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Probe, MaxJobs = capacity.Probe });
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.PlanReview, MaxJobs = capacity.PlanReview });
+        }
+        if (_options.Roles.HasFlag(WorkerRole.Transcoder))
+        {
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Cleanup, MaxJobs = capacity.Cleanup });
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Transcode, MaxJobs = capacity.Transcode });
+        }
+        if (_options.Roles.HasFlag(WorkerRole.Validator))
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.ValidateOutput, MaxJobs = capacity.Validation });
+        return requests.Where(x => x.MaxJobs > 0).ToList();
+    }
+
+    private async Task RunJobAsync(JobLeaseDto lease, CancellationToken cancellationToken)
+    {
+        try
+        {
+            UpdateActiveJob(lease.JobId, 0, $"Running {lease.JobType}");
+            logger.LogInformation("Starting {JobType} job {JobId}", lease.JobType, lease.JobId);
+            switch (lease.JobType)
+            {
+                case JobType.Probe:
+                    await RunProbeJobAsync(lease, cancellationToken);
+                    break;
+                case JobType.PlanReview:
+                    await RunPlanReviewJobAsync(lease, cancellationToken);
+                    break;
+                case JobType.Cleanup:
+                    await RunTranscodeJobAsync(lease, cancellationToken);
+                    break;
+                case JobType.Transcode:
+                    await RunTranscodeJobAsync(lease, cancellationToken);
+                    break;
+                default:
+                    await api.FailJobAsync(lease.JobId, new JobFailRequest
+                    {
+                        WorkerId = _options.WorkerId,
+                        WorkerInstanceId = _instanceId,
+                        LeaseId = lease.LeaseId,
+                        ErrorCode = "JobTypeNotImplemented",
+                        Message = $"Worker job type {lease.JobType} is not implemented in this initial pass."
+                    }, cancellationToken);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Job {JobId} failed", lease.JobId);
+            await api.FailJobAsync(lease.JobId, new JobFailRequest
+            {
+                WorkerId = _options.WorkerId,
+                WorkerInstanceId = _instanceId,
+                LeaseId = lease.LeaseId,
+                ErrorCode = ex.GetType().Name,
+                Message = ex.Message,
+                Details = ex.ToString()
+            }, cancellationToken);
+        }
+    }
+
+    private async Task RunProbeJobAsync(JobLeaseDto lease, CancellationToken cancellationToken)
+    {
+        UpdateActiveJob(lease.JobId, 0, "Probing file");
+        var inputPath = lease.Payload.GetProperty("inputPath").GetString() ?? throw new InvalidOperationException("Probe payload missing inputPath.");
+        logger.LogInformation("Probe started for {Path}", inputPath);
+        if (!pathMapper.TryMap(inputPath, out var localPath))
+            throw new InvalidOperationException($"No path mapping found for {inputPath}");
+
+        var probeJson = await ffprobe.ProbeAsync(localPath, cancellationToken);
+        var result = JsonSerializer.SerializeToElement(new
+        {
+            probeJson = JsonDocument.Parse(probeJson).RootElement,
+            fileSizeBytes = new FileInfo(localPath).Length,
+            lastModifiedUtc = File.GetLastWriteTimeUtc(localPath)
+        }, _jsonOptions);
+
+        logger.LogInformation("Probe complete for {Path}", inputPath);
+        UpdateActiveJob(lease.JobId, 100, "Probe complete");
+        await api.CompleteJobAsync(lease.JobId, new JobCompleteRequest
+        {
+            WorkerId = _options.WorkerId,
+            WorkerInstanceId = _instanceId,
+            LeaseId = lease.LeaseId,
+            Result = result
+        }, cancellationToken);
+    }
+
+    private async Task RunPlanReviewJobAsync(JobLeaseDto lease, CancellationToken cancellationToken)
+    {
+        UpdateActiveJob(lease.JobId, 0, "Reviewing plan");
+        var inputPath = lease.Payload.GetProperty("inputPath").GetString() ?? throw new InvalidOperationException("PlanReview payload missing inputPath.");
+        logger.LogInformation("Plan review started for {Path}", inputPath);
+        if (!pathMapper.TryMap(inputPath, out var localPath))
+            throw new InvalidOperationException($"No path mapping found for {inputPath}");
+
+        var probeJson = await ffprobe.ProbeAsync(localPath, cancellationToken);
+        using var probeDocument = JsonDocument.Parse(probeJson);
+        var messages = new List<string>();
+        var status = "Approved";
+
+        if (lease.Payload.TryGetProperty("fileSizeBytes", out var expectedSizeElement) && expectedSizeElement.TryGetInt64(out var expectedSize))
+        {
+            var actualSize = new FileInfo(localPath).Length;
+            if (actualSize != expectedSize)
+            {
+                status = "Rejected";
+                messages.Add($"File size changed. Expected {expectedSize}, actual {actualSize}.");
+            }
+        }
+
+        if (lease.Payload.TryGetProperty("lastModifiedUtc", out var expectedModifiedElement) && expectedModifiedElement.TryGetDateTime(out var expectedModified))
+        {
+            var actualModified = File.GetLastWriteTimeUtc(localPath);
+            if (Math.Abs((actualModified - expectedModified).TotalSeconds) > 2)
+            {
+                status = "Rejected";
+                messages.Add($"Last modified time changed. Expected {expectedModified:o}, actual {actualModified:o}.");
+            }
+        }
+
+        if (lease.Payload.TryGetProperty("planJson", out var planElement) && planElement.TryGetProperty("streams", out var planStreams))
+        {
+            var availableIndexes = probeDocument.RootElement.GetProperty("streams").EnumerateArray()
+                .Where(x => x.TryGetProperty("index", out _))
+                .Select(x => x.GetProperty("index").GetInt32())
+                .ToHashSet();
+
+            foreach (var stream in planStreams.EnumerateArray())
+            {
+                if (!stream.TryGetProperty("sourceStreamIndex", out var indexElement))
+                    continue;
+                var index = indexElement.GetInt32();
+                if (!availableIndexes.Contains(index))
+                {
+                    status = "Rejected";
+                    messages.Add($"Planned stream index {index} does not exist in reprobe result.");
+                }
+            }
+        }
+
+        var result = JsonSerializer.SerializeToElement(new
+        {
+            reviewStatus = status,
+            messages,
+            reprobeJson = probeDocument.RootElement.Clone(),
+            reprobedFileSizeBytes = new FileInfo(localPath).Length,
+            reprobedLastModifiedUtc = File.GetLastWriteTimeUtc(localPath)
+        }, _jsonOptions);
+
+        logger.LogInformation("Plan review {Status} for {Path}", status, inputPath);
+        UpdateActiveJob(lease.JobId, 100, $"Plan review {status}");
+        await api.CompleteJobAsync(lease.JobId, new JobCompleteRequest
+        {
+            WorkerId = _options.WorkerId,
+            WorkerInstanceId = _instanceId,
+            LeaseId = lease.LeaseId,
+            Result = result
+        }, cancellationToken);
+    }
+
+
+
+    private async Task RunTranscodeJobAsync(JobLeaseDto lease, CancellationToken cancellationToken)
+    {
+        var operationName = lease.JobType == JobType.Cleanup ? "cleanup" : "transcode";
+        UpdateActiveJob(lease.JobId, 0, $"Preparing {operationName}");
+
+        var inputPath = lease.Payload.GetProperty("inputPath").GetString()
+            ?? throw new InvalidOperationException("Transcode payload missing inputPath.");
+        var stagingOutputPath = lease.Payload.GetProperty("stagingOutputPath").GetString()
+            ?? throw new InvalidOperationException("Transcode payload missing stagingOutputPath.");
+
+        logger.LogInformation("{Operation} started for {Path}", operationName, inputPath);
+
+        if (!pathMapper.TryMap(inputPath, out var localInputPath))
+            throw new InvalidOperationException($"No path mapping found for input path {inputPath}");
+        if (!pathMapper.TryMap(stagingOutputPath, out var localStagingOutputPath))
+            throw new InvalidOperationException($"No path mapping found for staging path {stagingOutputPath}");
+
+        var ffmpegArgs = ReadStringArray(lease.Payload, "ffmpegArgs");
+        if (ffmpegArgs.Count == 0 && lease.Payload.TryGetProperty("planJson", out var planElement))
+            ffmpegArgs = ReadStringArray(planElement, "ffmpegArgs");
+        if (ffmpegArgs.Count == 0)
+            throw new InvalidOperationException("Transcode payload contains no ffmpeg arguments.");
+
+        var jobWorkRoot = Path.Combine(_options.LocalWorkingRoot, $"job-{lease.JobId}", $"lease-{lease.LeaseId}");
+        Directory.CreateDirectory(jobWorkRoot);
+
+        var extension = Path.GetExtension(localStagingOutputPath);
+        if (string.IsNullOrWhiteSpace(extension)) extension = ".mkv";
+        var localOutputPath = Path.Combine(jobWorkRoot, "output" + extension);
+        var logPath = Path.Combine(jobWorkRoot, "ffmpeg.log");
+
+        UpdateActiveJob(lease.JobId, 1, lease.JobType == JobType.Cleanup ? "Remuxing cleanup to local scratch" : "Encoding to local scratch");
+        var runResult = await ffmpeg.RunAsync(
+            ffmpegArgs,
+            localInputPath,
+            localOutputPath,
+            (progress, message) => UpdateActiveJob(lease.JobId, progress, message),
+            cancellationToken);
+
+        await File.WriteAllTextAsync(logPath, runResult.LogText, cancellationToken);
+
+        UpdateActiveJob(lease.JobId, 96, "Validating local output");
+        await ffprobe.ProbeAsync(localOutputPath, cancellationToken);
+
+        var stagingDirectory = Path.GetDirectoryName(localStagingOutputPath);
+        if (!string.IsNullOrWhiteSpace(stagingDirectory))
+            Directory.CreateDirectory(stagingDirectory);
+
+        var stagingPartialPath = localStagingOutputPath + $".partial-{lease.LeaseId}";
+        var localStagingCompleteMarkerPath = localStagingOutputPath + ".complete.json";
+        var stagingCompleteMarkerPath = stagingOutputPath + ".complete.json";
+        if (File.Exists(stagingPartialPath)) File.Delete(stagingPartialPath);
+
+        UpdateActiveJob(lease.JobId, 98, "Copying to staging partial file");
+        File.Copy(localOutputPath, stagingPartialPath, overwrite: true);
+
+        UpdateActiveJob(lease.JobId, 99, "Validating staged partial output");
+        await ffprobe.ProbeAsync(stagingPartialPath, cancellationToken);
+
+        if (File.Exists(localStagingOutputPath)) File.Delete(localStagingOutputPath);
+        File.Move(stagingPartialPath, localStagingOutputPath);
+
+        await File.WriteAllTextAsync(localStagingCompleteMarkerPath, JsonSerializer.Serialize(new
+        {
+            jobId = lease.JobId,
+            leaseId = lease.LeaseId,
+            jobType = lease.JobType.ToString(),
+            operation = operationName,
+            completedUtc = DateTime.UtcNow,
+            outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length
+        }, _jsonOptions), cancellationToken);
+
+        var outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length;
+        var inputFileSizeBytes = new FileInfo(localInputPath).Length;
+        var result = JsonSerializer.SerializeToElement(new
+        {
+            inputPath,
+            stagingOutputPath,
+            localOutputPath = _options.KeepLocalJobFilesOnSuccess ? localOutputPath : null,
+            logPath = _options.KeepLocalJobFilesOnSuccess ? logPath : null,
+            stagingCompleteMarkerPath,
+            localStagingCompleteMarkerPath,
+            stagingTransferComplete = true,
+            exitCode = runResult.ExitCode,
+            elapsedSeconds = runResult.Elapsed.TotalSeconds,
+            outputFileSizeBytes,
+            savedBytes = inputFileSizeBytes - outputFileSizeBytes,
+            completedUtc = DateTime.UtcNow,
+            jobType = lease.JobType.ToString(),
+            operation = operationName,
+            inputFileSizeBytes
+        }, _jsonOptions);
+
+        if (!_options.KeepLocalJobFilesOnSuccess)
+        {
+            TryDeleteDirectory(jobWorkRoot);
+            TryDeleteEmptyParentDirectories(jobWorkRoot, _options.LocalWorkingRoot);
+        }
+
+        logger.LogInformation("{Operation} complete for {Path}. Output size {OutputSizeBytes} bytes, saved {SavedBytes} bytes.", operationName, inputPath, outputFileSizeBytes, inputFileSizeBytes - outputFileSizeBytes);
+        UpdateActiveJob(lease.JobId, 100, lease.JobType == JobType.Cleanup ? "Cleanup staged" : "Transcode staged");
+        await api.CompleteJobAsync(lease.JobId, new JobCompleteRequest
+        {
+            WorkerId = _options.WorkerId,
+            WorkerInstanceId = _instanceId,
+            LeaseId = lease.LeaseId,
+            Result = result
+        }, cancellationToken);
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            // Keep failed cleanup silent; stale scratch is preferable to failing a completed job report.
+        }
+    }
+
+    private static void TryDeleteEmptyParentDirectories(string childPath, string stopAtRoot)
+    {
+        try
+        {
+            var root = Path.GetFullPath(stopAtRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var directory = Directory.GetParent(Path.GetFullPath(childPath));
+
+            while (directory is not null)
+            {
+                var current = directory.FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (string.Equals(current, root, StringComparison.OrdinalIgnoreCase))
+                    break;
+
+                if (!Directory.Exists(current) || Directory.EnumerateFileSystemEntries(current).Any())
+                    break;
+
+                Directory.Delete(current, recursive: false);
+                directory = directory.Parent;
+            }
+        }
+        catch
+        {
+            // Empty folder cleanup is best-effort only.
+        }
+    }
+
+    private static List<string> ReadStringArray(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var array) || array.ValueKind != JsonValueKind.Array)
+            return [];
+
+        return array.EnumerateArray()
+            .Select(x => x.ValueKind == JsonValueKind.String ? x.GetString() : x.ToString())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x!)
+            .ToList();
+    }
+
+
+    private void UpdateActiveJob(long jobId, double? progress, string message)
+    {
+        if (_activeJobs.TryGetValue(jobId, out var active))
+        {
+            if (progress is not null)
+                active.Progress = progress;
+            active.Message = message;
+        }
+    }
+
+    private void TrackIdleState(bool idle, WorkerControlState state, CancellationToken cancellationToken)
+    {
+        if (!idle)
+        {
+            _idleSinceUtc = null;
+            return;
+        }
+
+        _idleSinceUtc ??= DateTime.UtcNow;
+        var idleFor = DateTime.UtcNow - _idleSinceUtc.Value;
+        if (idleFor.TotalSeconds < _options.Shutdown.IdleSecondsBeforeAction)
+            return;
+
+        if (state is WorkerControlState.DrainThenExit or WorkerControlState.DrainThenShutdown)
+        {
+            _ = shutdown.ApplyAsync(state, cancellationToken);
+        }
+    }
+
+    private sealed class ActiveJobState
+    {
+        public long JobId { get; init; }
+        public string LeaseId { get; init; } = string.Empty;
+        public JobType JobType { get; init; }
+        public double? Progress { get; set; }
+        public string? Message { get; set; }
+        public double? Fps { get; set; }
+        public int? EtaSeconds { get; set; }
+    }
+}

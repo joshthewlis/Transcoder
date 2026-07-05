@@ -1,0 +1,84 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Transcoder.Contracts;
+using Transcoder.Server.Data;
+using Transcoder.Server.Options;
+
+namespace Transcoder.Server.Services;
+
+public sealed class WorkerMonitorService(IServiceProvider services, IOptions<WorkerTimingOptions> timingOptions, ILogger<WorkerMonitorService> logger) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var scope = services.CreateScope();
+                var db = scope.ServiceProvider.GetRequiredService<TranscoderDbContext>();
+                await UpdateWorkersAndRequeueLostJobsAsync(db, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Worker monitor failed");
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
+        }
+    }
+
+    private async Task UpdateWorkersAndRequeueLostJobsAsync(TranscoderDbContext db, CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+        var timing = timingOptions.Value;
+        var workers = await db.Workers.ToListAsync(cancellationToken);
+
+        foreach (var worker in workers)
+        {
+            if (worker.ControlState == WorkerControlState.Disabled)
+            {
+                worker.State = WorkerState.Disabled;
+                continue;
+            }
+
+            if (worker.State is WorkerState.RequirementsFailed or WorkerState.PathCheckRequired or WorkerState.PathCheckFailed)
+                continue;
+
+            if (worker.LastSeenUtc is null)
+                continue;
+
+            var age = now - worker.LastSeenUtc.Value;
+            worker.State = age.TotalSeconds switch
+            {
+                var seconds when seconds > timing.LostAfterSeconds => WorkerState.Lost,
+                var seconds when seconds > timing.UnresponsiveAfterSeconds => WorkerState.Unresponsive,
+                _ when worker.ControlState != WorkerControlState.Normal => WorkerState.Draining,
+                _ => WorkerState.Online
+            };
+        }
+
+        var expiredJobs = await db.Jobs
+            .Where(x => (x.Status == JobStatus.Leased || x.Status == JobStatus.Running) && x.LeaseExpiresUtc != null && x.LeaseExpiresUtc < now)
+            .ToListAsync(cancellationToken);
+
+        foreach (var job in expiredJobs)
+        {
+            job.LastError = "Worker lease expired; job requeued.";
+            job.LastLeaseId = job.LeaseId;
+            job.LeaseId = null;
+            job.LeasedByWorkerId = null;
+            job.LeasedByWorkerInstanceId = null;
+            job.LeaseStartedUtc = null;
+            job.LeaseLastSeenUtc = null;
+            job.LeaseExpiresUtc = null;
+            job.Progress = null;
+            job.Status = job.AttemptNumber >= job.MaxAttempts ? JobStatus.Failed : JobStatus.Queued;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+    }
+}
