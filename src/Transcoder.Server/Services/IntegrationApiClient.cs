@@ -15,74 +15,100 @@ public sealed class IntegrationApiClient(IHttpClientFactory httpClientFactory, I
     {
         try
         {
-            var client = httpClientFactory.CreateClient();
-            var url = integration.IntegrationType switch
+            var client = CreateClient(integration);
+
+            var path = integration.IntegrationType switch
             {
-                IntegrationType.Radarr => BuildUrl(integration, "/api/v3/system/status"),
-                IntegrationType.Sonarr => BuildUrl(integration, "/api/v3/system/status"),
-                IntegrationType.Tmdb => BuildUrl(integration, "/3/configuration", includeApiKey: true),
-                IntegrationType.Imdb => integration.BaseUrl,
-                _ => integration.BaseUrl
+                IntegrationType.Radarr => "api/v3/system/status",
+                IntegrationType.Sonarr => "api/v3/system/status",
+                IntegrationType.Tmdb => "3/configuration",
+                IntegrationType.Imdb => "",
+                _ => ""
             };
+
+            var url = BuildRelativeUrl(integration, path, includeApiKey: integration.IntegrationType == IntegrationType.Tmdb);
 
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             AddHeaders(request, integration);
+
             using var response = await client.SendAsync(request, cancellationToken);
             var body = await response.Content.ReadAsStringAsync(cancellationToken);
+
             if (!response.IsSuccessStatusCode)
-                return new TestIntegrationResultDto { Success = false, Message = $"{(int)response.StatusCode} {response.ReasonPhrase}: {body[..Math.Min(250, body.Length)]}" };
+            {
+                return new TestIntegrationResultDto
+                {
+                    Success = false,
+                    Message = $"{(int)response.StatusCode} {response.ReasonPhrase}: {body[..Math.Min(250, body.Length)]}"
+                };
+            }
 
             var version = TryGetString(body, "version") ?? TryGetString(body, "name");
-            return new TestIntegrationResultDto { Success = true, Message = "Connection successful.", Version = version };
+
+            return new TestIntegrationResultDto
+            {
+                Success = true,
+                Message = "Connection successful.",
+                Version = version
+            };
         }
         catch (Exception ex)
         {
-            return new TestIntegrationResultDto { Success = false, Message = ex.Message };
+            logger.LogWarning(ex, "Integration test failed for {IntegrationType} {BaseUrl}", integration.IntegrationType, integration.BaseUrl);
+
+            return new TestIntegrationResultDto
+            {
+                Success = false,
+                Message = ex.Message
+            };
         }
     }
 
     public Task<List<JsonElement>> GetRadarrMoviesAsync(IntegrationEntity integration, CancellationToken cancellationToken = default)
-        => GetJsonArrayAsync($"radarr:{integration.Id}:movies", integration, "/api/v3/movie", cancellationToken);
+        => GetJsonArrayAsync($"radarr:{integration.Id}:movies", integration, "api/v3/movie", cancellationToken);
 
     public Task<List<JsonElement>> GetSonarrSeriesAsync(IntegrationEntity integration, CancellationToken cancellationToken = default)
-        => GetJsonArrayAsync($"sonarr:{integration.Id}:series", integration, "/api/v3/series", cancellationToken);
+        => GetJsonArrayAsync($"sonarr:{integration.Id}:series", integration, "api/v3/series", cancellationToken);
 
     public async Task<string?> GetTmdbMovieOriginalLanguageAsync(IntegrationEntity tmdb, int tmdbId, CancellationToken cancellationToken = default)
     {
-        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:movie:{tmdbId}", tmdb, $"/3/movie/{tmdbId}", cancellationToken, includeApiKey: true);
+        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:movie:{tmdbId}", tmdb, $"3/movie/{tmdbId}", cancellationToken, includeApiKey: true);
         return TryGetString(json, "original_language");
     }
 
     public async Task<string?> GetTmdbTvOriginalLanguageAsync(IntegrationEntity tmdb, int tmdbId, CancellationToken cancellationToken = default)
     {
-        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:tv:{tmdbId}", tmdb, $"/3/tv/{tmdbId}", cancellationToken, includeApiKey: true);
+        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:tv:{tmdbId}", tmdb, $"3/tv/{tmdbId}", cancellationToken, includeApiKey: true);
         return TryGetString(json, "original_language");
     }
 
     public async Task<int?> FindTmdbTvIdByTvdbIdAsync(IntegrationEntity tmdb, int tvdbId, CancellationToken cancellationToken = default)
     {
-        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:tvdb:{tvdbId}", tmdb, $"/3/find/{tvdbId}?external_source=tvdb_id", cancellationToken, includeApiKey: true);
+        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:tvdb:{tvdbId}", tmdb, $"3/find/{tvdbId}?external_source=tvdb_id", cancellationToken, includeApiKey: true);
         return TryGetFirstId(json, "tv_results");
     }
 
     public async Task<int?> FindTmdbMovieIdByImdbIdAsync(IntegrationEntity tmdb, string imdbId, CancellationToken cancellationToken = default)
     {
-        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:imdb:{imdbId}", tmdb, $"/3/find/{Uri.EscapeDataString(imdbId)}?external_source=imdb_id", cancellationToken, includeApiKey: true);
+        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:imdb:{imdbId}", tmdb, $"3/find/{Uri.EscapeDataString(imdbId)}?external_source=imdb_id", cancellationToken, includeApiKey: true);
         return TryGetFirstId(json, "movie_results");
     }
 
     public async Task<int?> FindTmdbTvIdByImdbIdAsync(IntegrationEntity tmdb, string imdbId, CancellationToken cancellationToken = default)
     {
-        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:imdbtv:{imdbId}", tmdb, $"/3/find/{Uri.EscapeDataString(imdbId)}?external_source=imdb_id", cancellationToken, includeApiKey: true);
+        var json = await GetJsonAsync($"tmdb:{tmdb.Id}:find:imdbtv:{imdbId}", tmdb, $"3/find/{Uri.EscapeDataString(imdbId)}?external_source=imdb_id", cancellationToken, includeApiKey: true);
         return TryGetFirstId(json, "tv_results");
     }
 
     private async Task<List<JsonElement>> GetJsonArrayAsync(string cacheKey, IntegrationEntity integration, string path, CancellationToken cancellationToken)
     {
         var json = await GetJsonAsync(cacheKey, integration, path, cancellationToken);
+
         using var document = JsonDocument.Parse(json);
+
         if (document.RootElement.ValueKind != JsonValueKind.Array)
             return [];
+
         return document.RootElement.EnumerateArray().Select(x => x.Clone()).ToList();
     }
 
@@ -91,27 +117,53 @@ public sealed class IntegrationApiClient(IHttpClientFactory httpClientFactory, I
         if (cache.TryGetValue(cacheKey, out var entry) && DateTime.UtcNow - entry.CreatedUtc < CacheTtl)
             return entry.Json;
 
-        var client = httpClientFactory.CreateClient();
-        var url = BuildUrl(integration, path, includeApiKey);
+        var client = CreateClient(integration);
+        var url = BuildRelativeUrl(integration, path, includeApiKey);
+
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         AddHeaders(request, integration);
+
         using var response = await client.SendAsync(request, cancellationToken);
         var json = await response.Content.ReadAsStringAsync(cancellationToken);
+
         response.EnsureSuccessStatusCode();
+
         cache[cacheKey] = new CacheEntry(DateTime.UtcNow, json);
+
         return json;
     }
 
-    private static string BuildUrl(IntegrationEntity integration, string path, bool includeApiKey = false)
+    private static HttpClient CreateClient(IntegrationEntity integration)
     {
-        var baseUrl = string.IsNullOrWhiteSpace(integration.BaseUrl)
-            ? integration.IntegrationType == IntegrationType.Tmdb ? "https://api.themoviedb.org" : string.Empty
-            : integration.BaseUrl.TrimEnd('/');
+        var baseUrl = GetBaseUrl(integration);
 
-        if (Uri.TryCreate(path, UriKind.Absolute, out _))
-            return path;
+        if (!Uri.TryCreate(baseUrl.TrimEnd('/') + "/", UriKind.Absolute, out var baseUri))
+            throw new InvalidOperationException($"Integration base URL is not valid: {baseUrl}");
 
-        var url = $"{baseUrl}{path}";
+        var client = new HttpClient
+        {
+            BaseAddress = baseUri,
+            Timeout = TimeSpan.FromSeconds(20)
+        };
+
+        return client;
+    }
+
+    private static string GetBaseUrl(IntegrationEntity integration)
+    {
+        if (!string.IsNullOrWhiteSpace(integration.BaseUrl))
+            return integration.BaseUrl.Trim();
+
+        if (integration.IntegrationType == IntegrationType.Tmdb)
+            return "https://api.themoviedb.org";
+
+        throw new InvalidOperationException($"{integration.IntegrationType} base URL is required.");
+    }
+
+    private static string BuildRelativeUrl(IntegrationEntity integration, string path, bool includeApiKey = false)
+    {
+        var url = path.TrimStart('/');
+
         if (integration.IntegrationType is IntegrationType.Radarr or IntegrationType.Sonarr && !string.IsNullOrWhiteSpace(integration.ApiKey))
         {
             url += url.Contains('?') ? "&" : "?";
@@ -135,7 +187,8 @@ public sealed class IntegrationApiClient(IHttpClientFactory httpClientFactory, I
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", integration.ApiKey);
     }
 
-    private static bool LooksLikeBearerToken(string? value) => !string.IsNullOrWhiteSpace(value) && value.Length > 80;
+    private static bool LooksLikeBearerToken(string? value)
+        => !string.IsNullOrWhiteSpace(value) && value.Length > 80;
 
     private static string? TryGetString(string json, string propertyName)
     {
@@ -144,13 +197,17 @@ public sealed class IntegrationApiClient(IHttpClientFactory httpClientFactory, I
             using var document = JsonDocument.Parse(json);
             return TryGetString(document.RootElement, propertyName);
         }
-        catch { return null; }
+        catch
+        {
+            return null;
+        }
     }
 
     public static string? TryGetString(JsonElement element, string propertyName)
     {
         if (!element.TryGetProperty(propertyName, out var value))
             return null;
+
         return value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
     }
 
@@ -158,17 +215,25 @@ public sealed class IntegrationApiClient(IHttpClientFactory httpClientFactory, I
     {
         if (!element.TryGetProperty(propertyName, out var value))
             return null;
-        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)) return number;
-        if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number)) return number;
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+            return number;
+
+        if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number))
+            return number;
+
         return null;
     }
 
     private static int? TryGetFirstId(string json, string arrayProperty)
     {
         using var document = JsonDocument.Parse(json);
+
         if (!document.RootElement.TryGetProperty(arrayProperty, out var results) || results.ValueKind != JsonValueKind.Array)
             return null;
+
         var first = results.EnumerateArray().FirstOrDefault();
+
         return first.ValueKind == JsonValueKind.Object ? TryGetInt(first, "id") : null;
     }
 
