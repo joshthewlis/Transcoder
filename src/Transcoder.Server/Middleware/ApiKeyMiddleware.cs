@@ -9,6 +9,7 @@ public sealed class ApiKeyMiddleware(RequestDelegate next, IOptions<SecurityOpti
 
     public async Task Invoke(HttpContext context)
     {
+        /*
         var security = options.Value;
         var hasConfiguredKey = !string.IsNullOrWhiteSpace(security.AdminApiKey) || !string.IsNullOrWhiteSpace(security.WorkerApiKey);
 
@@ -35,6 +36,7 @@ public sealed class ApiKeyMiddleware(RequestDelegate next, IOptions<SecurityOpti
             await context.Response.WriteAsync("Missing or invalid Transcoder API key.");
             return;
         }
+        */
 
         await next(context);
     }
