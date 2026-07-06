@@ -250,13 +250,6 @@
             <div class="pager" data-pager="media"><button class="button" data-page-action="prev" data-page-target="media">Prev</button><span id="media-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="media">Next</button><label>Page size <select id="media-page-size" data-page-size="media"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
           </section>
 
-          <section class="panel" id="plan-details-panel" hidden>
-            <div class="panel-header">
-              <h2>Media Plan</h2>
-              <button class="button" id="close-plan-details">Close</button>
-            </div>
-            <div id="plan-details-content"></div>
-          </section>
         </section>
 
         <section class="page" id="page-review">
@@ -380,6 +373,18 @@
       </main>
     </div>
   </div>
-  <script src="/js/app.js?v=31"></script>
+  <div id="plan-modal" class="modal-backdrop" hidden>
+    <section class="modal plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="plan-modal-title">Media Plan</h2>
+          <p id="plan-modal-subtitle" class="muted"></p>
+        </div>
+        <button class="button" id="close-plan-modal" type="button">Close</button>
+      </div>
+      <div id="plan-modal-content" class="modal-content"></div>
+    </section>
+  </div>
+  <script src="/js/app.js?v=31.1"></script>
 </body>
 </html>

@@ -79,9 +79,12 @@ document.getElementById('reset-library-form')?.addEventListener('click', () => {
   setLibraryMessage('');
 });
 
-document.getElementById('close-plan-details')?.addEventListener('click', () => {
-  const panel = document.getElementById('plan-details-panel');
-  if (panel) panel.hidden = true;
+document.getElementById('close-plan-modal')?.addEventListener('click', closePlanModal);
+document.getElementById('plan-modal')?.addEventListener('click', event => {
+  if (event.target?.id === 'plan-modal') closePlanModal();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closePlanModal();
 });
 
 document.querySelectorAll('[data-page-size]').forEach(el => el.addEventListener('change', () => {
@@ -1245,21 +1248,48 @@ window.replaceMedia = async (mediaId) => {
   }
 };
 
-window.showMediaPlan = async (mediaId) => {
-  const panel = document.getElementById('plan-details-panel');
-  const content = document.getElementById('plan-details-content');
-  if (!panel || !content) return;
+window.showMediaPlan = async (mediaId, title = null, subtitle = null) => {
+  openPlanModal(title || `Media ${mediaId} Plan`, subtitle || 'Loading plan...');
+
+  const content = document.getElementById('plan-modal-content');
+  if (!content) return;
+
+  content.innerHTML = `<div class="muted">Loading plan...</div>`;
 
   try {
     const plan = await api(`/api/media/${mediaId}/plan`);
-    panel.hidden = false;
     content.innerHTML = renderPlanDetails(plan);
-    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+    const modalSubtitle = document.getElementById('plan-modal-subtitle');
+    if (modalSubtitle && !subtitle) {
+      modalSubtitle.textContent = plan.inputPath || `Media ID ${mediaId}`;
+    }
   } catch (error) {
-    panel.hidden = false;
     content.innerHTML = `<div class="form-message bad">No plan found for media ${mediaId}. Run Plan first.</div>`;
   }
 };
+
+function openPlanModal(title, subtitle = '') {
+  const modal = document.getElementById('plan-modal');
+  const modalTitle = document.getElementById('plan-modal-title');
+  const modalSubtitle = document.getElementById('plan-modal-subtitle');
+
+  if (!modal) return;
+  if (modalTitle) modalTitle.textContent = title || 'Media Plan';
+  if (modalSubtitle) modalSubtitle.textContent = subtitle || '';
+
+  modal.hidden = false;
+  document.body.classList.add('modal-open');
+  document.getElementById('close-plan-modal')?.focus();
+}
+
+function closePlanModal() {
+  const modal = document.getElementById('plan-modal');
+  if (!modal || modal.hidden) return;
+
+  modal.hidden = true;
+  document.body.classList.remove('modal-open');
+}
 
 function renderPlanDetails(plan) {
   const ffmpegCommand = ['ffmpeg', ...(plan.ffmpegArgs || [])]
@@ -1368,7 +1398,7 @@ async function refreshReview() {
     { title: 'Severity', render: r => badge(r.severity) },
     { title: 'Reason', key: 'reason' },
     { title: 'Created', render: r => date(r.createdUtc) },
-    { title: 'Actions', render: r => `<div class="button-row"><button class="button" onclick="approveReview(${r.id})">Approve</button><button class="button" onclick="skipReview(${r.id})">Skip</button></div>` }
+    { title: 'Actions', render: renderReviewActions }
   ], result.items ?? []);
 }
 
@@ -1377,6 +1407,21 @@ function renderReviewMedia(review) {
   const name = review.mediaName || review.mediaRelativePath || `Media ${review.mediaItemId}`;
   const path = review.mediaRelativePath && review.mediaRelativePath !== name ? `<br><small>${escapeHtml(review.mediaRelativePath)}</small>` : '';
   return `<strong>${escapeHtml(name)}</strong><br><small>ID ${review.mediaItemId}</small>${path}`;
+}
+
+function renderReviewActions(review) {
+  const name = review.mediaName || review.mediaRelativePath || `Media ${review.mediaItemId}`;
+  const subtitle = [
+    review.libraryName,
+    review.mediaRelativePath
+  ].filter(Boolean).join(' · ');
+
+  return `
+    <div class="button-row">
+      <button class="button" onclick="showMediaPlan(${review.mediaItemId}, '${escapeAttribute(name)} Plan', '${escapeAttribute(subtitle)}')">View Plan</button>
+      <button class="button primary" onclick="approveReview(${review.id})">Approve</button>
+      <button class="button" onclick="skipReview(${review.id})">Skip</button>
+    </div>`;
 }
 
 window.approveReview = async (reviewId) => {

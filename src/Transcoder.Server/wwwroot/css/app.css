@@ -403,3 +403,76 @@ select {
   padding: 7px 9px;
 }
 .form-grid > .checkbox-stack { grid-column: 1 / -1; }
+
+body.modal-open {
+  overflow: hidden;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(3, 8, 14, 0.72);
+}
+
+.modal-backdrop[hidden] {
+  display: none;
+}
+
+.modal {
+  width: min(1180px, 96vw);
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--colour-surface);
+  border: 1px solid var(--colour-border);
+  border-radius: var(--radius);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.42);
+}
+
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--colour-border);
+}
+
+.modal-header h2 {
+  margin: 0 0 4px;
+}
+
+.modal-header p {
+  margin: 0;
+  word-break: break-word;
+}
+
+.modal-content {
+  overflow: auto;
+  padding: 16px;
+}
+
+.plan-modal .stream-plan {
+  min-width: 980px;
+}
+
+@media (max-width: 760px) {
+  .modal-backdrop {
+    align-items: stretch;
+    padding: 10px;
+  }
+
+  .modal {
+    width: 100%;
+    max-height: none;
+  }
+
+  .modal-header {
+    flex-direction: column;
+  }
+}
