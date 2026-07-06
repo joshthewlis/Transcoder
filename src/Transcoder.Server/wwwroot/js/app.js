@@ -178,6 +178,10 @@ function escapeAttribute(value) {
   return escapeHtml(value).replaceAll('`', '&#096;');
 }
 
+function jsStringArg(value) {
+  return escapeAttribute(JSON.stringify(String(value ?? '')));
+}
+
 function numberOrDefault(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -1415,10 +1419,12 @@ function renderReviewActions(review) {
     review.libraryName,
     review.mediaRelativePath
   ].filter(Boolean).join(' · ');
+  const titleArg = jsStringArg(`${name} Plan`);
+  const subtitleArg = jsStringArg(subtitle);
 
   return `
     <div class="button-row">
-      <button class="button" onclick="showMediaPlan(${review.mediaItemId}, '${escapeAttribute(name)} Plan', '${escapeAttribute(subtitle)}')">View Plan</button>
+      <button class="button" onclick="showMediaPlan(${review.mediaItemId}, ${titleArg}, ${subtitleArg})">View Plan</button>
       <button class="button primary" onclick="approveReview(${review.id})">Approve</button>
       <button class="button" onclick="skipReview(${review.id})">Skip</button>
     </div>`;
