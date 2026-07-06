@@ -262,6 +262,19 @@ public sealed class TranscodePlanService(
         var maxFiles = Math.Clamp(request.MaxFiles <= 0 ? 5 : request.MaxFiles, 1, 25);
         var maxEstimatedStagingBytes = request.MaxEstimatedStagingBytes is > 0 ? request.MaxEstimatedStagingBytes : null;
 
+        var minEstimatedSavingBytes = request.MinEstimatedSavingBytes is > 0 ? request.MinEstimatedSavingBytes.Value : 0;
+
+        var activeMediaIds = await db.Jobs.AsNoTracking()
+            .Where(x => x.LibraryId == libraryId
+                && x.MediaItemId != null
+                && (x.JobType == JobType.Cleanup || x.JobType == JobType.Transcode)
+                && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
+            .Select(x => x.MediaItemId!.Value)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+
+        var activeMediaIdSet = activeMediaIds.ToHashSet();
+
         var exists = await db.Libraries.AnyAsync(x => x.Id == libraryId, cancellationToken);
         var result = new PilotRunResultDto
         {
@@ -292,6 +305,12 @@ public sealed class TranscodePlanService(
         foreach (var media in mediaItems)
         {
             result.Considered++;
+
+            if (activeMediaIdSet.Contains(media.Id))
+            {
+                result.Skipped++;
+                continue;
+            }
 
             if (!IsPilotEligibleStatus(media.Status))
             {
@@ -330,8 +349,19 @@ public sealed class TranscodePlanService(
             }
 
             var estimatedOutputBytes = plan.EstimatedOutputSizeBytes ?? media.FileSizeBytes;
-            var estimatedSavingBytes = plan.EstimatedRemovedBytes
-                ?? (estimatedOutputBytes > 0 ? Math.Max(0, media.FileSizeBytes - estimatedOutputBytes) : 0);
+            var estimatedSavingBytes = plan.EstimatedRemovedBytes ?? (estimatedOutputBytes > 0 ? Math.Max(0, media.FileSizeBytes - estimatedOutputBytes) : 0);
+
+            estimatedSavingBytes = Math.Max(0, estimatedSavingBytes);
+
+            if (estimatedSavingBytes <= 0 || estimatedSavingBytes < minEstimatedSavingBytes)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            var estimatedSavingRatio = media.FileSizeBytes > 0
+                ? (double)estimatedSavingBytes / media.FileSizeBytes
+                : 0;
 
             candidates.Add(new PilotCandidate(
                 media.Id,
@@ -340,12 +370,23 @@ public sealed class TranscodePlanService(
                 plan.PlanKind,
                 media.FileSizeBytes,
                 Math.Max(0, estimatedOutputBytes),
-                Math.Max(0, estimatedSavingBytes)));
+                estimatedSavingBytes,
+                estimatedSavingRatio));
         }
 
         var ordered = request.PreferSmallFiles
-            ? candidates.OrderBy(x => x.EstimatedOutputSizeBytes).ThenBy(x => x.RelativePath).ToList()
-            : candidates.OrderBy(x => x.RelativePath).ToList();
+            ? candidates
+                .OrderByDescending(x => x.EstimatedSavingRatio)
+                .ThenByDescending(x => x.EstimatedSavingBytes)
+                .ThenBy(x => x.EstimatedOutputSizeBytes)
+                .ThenBy(x => x.RelativePath)
+                .ToList()
+            : candidates
+                .OrderByDescending(x => x.EstimatedSavingBytes)
+                .ThenByDescending(x => x.EstimatedSavingRatio)
+                .ThenBy(x => x.EstimatedOutputSizeBytes)
+                .ThenBy(x => x.RelativePath)
+                .ToList();
 
         foreach (var candidate in ordered)
         {
@@ -359,13 +400,23 @@ public sealed class TranscodePlanService(
             }
 
             var queued = await QueueExistingPlanWorkAsync(candidate.MediaId, candidate.JobType, cancellationToken);
-            if (!queued.Accepted)
+
+            if (queued.AlreadyQueued)
+            {
+                result.AlreadyQueued++;
+                result.Skipped++;
+                continue;
+            }
+
+            if (!queued.Accepted || !queued.Queued)
             {
                 result.Skipped++;
                 if (result.Messages.Count < 10)
                     result.Messages.Add($"{candidate.RelativePath}: {queued.Message}");
                 continue;
             }
+
+            result.Queued++;
 
             if (queued.Queued) result.Queued++;
             if (queued.AlreadyQueued) result.AlreadyQueued++;
@@ -1753,7 +1804,8 @@ public sealed class TranscodePlanService(
         string PlanKind,
         long InputSizeBytes,
         long EstimatedOutputSizeBytes,
-        long EstimatedSavingBytes);
+        long EstimatedSavingBytes,
+        double EstimatedSavingRatio);
 
     private sealed class ProbeData
     {

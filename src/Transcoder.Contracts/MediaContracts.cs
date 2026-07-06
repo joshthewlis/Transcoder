@@ -104,6 +104,9 @@ public sealed class PilotRunRequestDto
     public bool QueueTranscode { get; set; } = true;
     public bool PreferSmallFiles { get; set; } = true;
     public long? MaxEstimatedStagingBytes { get; set; }
+
+    // New: avoid wasting pilot runs on tiny/zero-saving plans.
+    public long? MinEstimatedSavingBytes { get; set; } = 512L * 1024L * 1024L;
 }
 
 public sealed class PilotRunQueuedItemDto
