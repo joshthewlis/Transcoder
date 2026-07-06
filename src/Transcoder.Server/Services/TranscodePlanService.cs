@@ -256,6 +256,143 @@ public sealed class TranscodePlanService(
     public async Task<QueueLibraryWorkResultDto> QueueLibraryTranscodeFromExistingPlansAsync(int libraryId, CancellationToken cancellationToken = default) =>
         await QueueLibraryExistingPlanWorkAsync(libraryId, JobType.Transcode, cancellationToken);
 
+    public async Task<PilotRunResultDto> QueueLibraryPilotRunAsync(int libraryId, PilotRunRequestDto? request, CancellationToken cancellationToken = default)
+    {
+        request ??= new PilotRunRequestDto();
+        var maxFiles = Math.Clamp(request.MaxFiles <= 0 ? 5 : request.MaxFiles, 1, 25);
+        var maxEstimatedStagingBytes = request.MaxEstimatedStagingBytes is > 0 ? request.MaxEstimatedStagingBytes : null;
+
+        var exists = await db.Libraries.AnyAsync(x => x.Id == libraryId, cancellationToken);
+        var result = new PilotRunResultDto
+        {
+            LibraryId = libraryId,
+            MaxFiles = maxFiles,
+            MaxEstimatedStagingBytes = maxEstimatedStagingBytes
+        };
+
+        if (!exists)
+        {
+            result.Messages.Add("Library was not found.");
+            return result;
+        }
+
+        if (!request.QueueCleanup && !request.QueueTranscode)
+        {
+            result.Messages.Add("Pilot run skipped because both cleanup and transcode were disabled in the request.");
+            return result;
+        }
+
+        var mediaItems = await db.MediaItems.AsNoTracking()
+            .Where(x => x.LibraryId == libraryId && x.PlanJson != null && x.PlanJson != "")
+            .OrderBy(x => x.RelativePath)
+            .Take(5000)
+            .ToListAsync(cancellationToken);
+
+        var candidates = new List<PilotCandidate>();
+        foreach (var media in mediaItems)
+        {
+            result.Considered++;
+
+            if (!IsPilotEligibleStatus(media.Status))
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            TranscodePlanDto? plan;
+            try
+            {
+                plan = JsonSerializer.Deserialize<TranscodePlanDto>(media.PlanJson!, JsonOptions);
+            }
+            catch
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            if (plan is null || IsNoActionPlan(plan) || plan.BlockingReasons.Count > 0)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            var jobType = IsCleanupPlan(plan) ? JobType.Cleanup : JobType.Transcode;
+            if (jobType == JobType.Cleanup && !request.QueueCleanup)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            if (jobType == JobType.Transcode && !request.QueueTranscode)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            var estimatedOutputBytes = plan.EstimatedOutputSizeBytes ?? media.FileSizeBytes;
+            var estimatedSavingBytes = plan.EstimatedRemovedBytes
+                ?? (estimatedOutputBytes > 0 ? Math.Max(0, media.FileSizeBytes - estimatedOutputBytes) : 0);
+
+            candidates.Add(new PilotCandidate(
+                media.Id,
+                media.RelativePath,
+                jobType,
+                plan.PlanKind,
+                media.FileSizeBytes,
+                Math.Max(0, estimatedOutputBytes),
+                Math.Max(0, estimatedSavingBytes)));
+        }
+
+        var ordered = request.PreferSmallFiles
+            ? candidates.OrderBy(x => x.EstimatedOutputSizeBytes).ThenBy(x => x.RelativePath).ToList()
+            : candidates.OrderBy(x => x.RelativePath).ToList();
+
+        foreach (var candidate in ordered)
+        {
+            if (result.Items.Count >= maxFiles)
+                break;
+
+            if (maxEstimatedStagingBytes is not null && result.EstimatedStagingBytes + candidate.EstimatedOutputSizeBytes > maxEstimatedStagingBytes.Value)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            var queued = await QueueExistingPlanWorkAsync(candidate.MediaId, candidate.JobType, cancellationToken);
+            if (!queued.Accepted)
+            {
+                result.Skipped++;
+                if (result.Messages.Count < 10)
+                    result.Messages.Add($"{candidate.RelativePath}: {queued.Message}");
+                continue;
+            }
+
+            if (queued.Queued) result.Queued++;
+            if (queued.AlreadyQueued) result.AlreadyQueued++;
+
+            result.EstimatedStagingBytes += candidate.EstimatedOutputSizeBytes;
+            result.EstimatedSavingBytes += candidate.EstimatedSavingBytes;
+            result.Items.Add(new PilotRunQueuedItemDto
+            {
+                MediaId = candidate.MediaId,
+                RelativePath = candidate.RelativePath,
+                JobType = candidate.JobType,
+                PlanKind = candidate.PlanKind,
+                InputSizeBytes = candidate.InputSizeBytes,
+                EstimatedOutputSizeBytes = candidate.EstimatedOutputSizeBytes,
+                EstimatedSavingBytes = candidate.EstimatedSavingBytes,
+                Queued = queued.Queued,
+                AlreadyQueued = queued.AlreadyQueued,
+                Message = queued.Message
+            });
+        }
+
+        if (result.Messages.Count == 0)
+            result.Messages.Add($"Pilot run selected {result.Items.Count} file(s), queued {result.Queued} new job(s), and found {result.AlreadyQueued} already active job(s). Nothing will replace originals; outputs go to staging only.");
+
+        return result;
+    }
+
     private async Task<QueueLibraryWorkResultDto> QueueLibraryExistingPlanWorkAsync(int libraryId, JobType requestedJobType, CancellationToken cancellationToken)
     {
         var exists = await db.Libraries.AnyAsync(x => x.Id == libraryId, cancellationToken);
@@ -491,6 +628,14 @@ public sealed class TranscodePlanService(
         db.Jobs.Any(x => x.MediaItemId == mediaId
             && x.JobType == jobType
             && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running));
+
+
+    private static bool IsPilotEligibleStatus(MediaStatus status) => status is
+        MediaStatus.Probed or
+        MediaStatus.Planning or
+        MediaStatus.NeedsReview or
+        MediaStatus.ReadyToCleanup or
+        MediaStatus.ReadyToTranscode;
 
     private static bool HasApprovedPlanReview(MediaItemEntity media)
     {
@@ -1600,6 +1745,15 @@ public sealed class TranscodePlanService(
     }
 
     private sealed record ProfileCandidate(ProfileEntity Profile, EncoderEngine Engine);
+
+    private sealed record PilotCandidate(
+        long MediaId,
+        string RelativePath,
+        JobType JobType,
+        string PlanKind,
+        long InputSizeBytes,
+        long EstimatedOutputSizeBytes,
+        long EstimatedSavingBytes);
 
     private sealed class ProbeData
     {

@@ -120,6 +120,14 @@ public sealed class LibrariesController(TranscoderDbContext db, ScanQueue scanQu
     }
 
 
+
+    [HttpPost("{libraryId:int}/pilot-run")]
+    public async Task<ActionResult<PilotRunResultDto>> PilotRun(int libraryId, PilotRunRequestDto request, CancellationToken cancellationToken)
+    {
+        var result = await planner.QueueLibraryPilotRunAsync(libraryId, request, cancellationToken);
+        return result.Messages.Any(x => x == "Library was not found.") ? NotFound(result) : Accepted(result);
+    }
+
     [HttpPost("{libraryId:int}/cleanup/queue")]
     public async Task<ActionResult<QueueLibraryWorkResultDto>> QueueCleanup(int libraryId, CancellationToken cancellationToken)
     {

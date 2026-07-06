@@ -769,6 +769,7 @@ function renderLibraryActions(library) {
     <button class="button" onclick="saveLibraryMetadata(${library.id})">Save Policy</button>
     <button class="button" onclick="scanLibrary(${library.id})">Scan</button>
     <button class="button" onclick="refreshLibraryMetadata(${library.id})">Refresh Metadata</button>
+    <button class="button primary" onclick="queueLibraryPilotRun(${library.id})">Pilot Run</button>
     <button class="button" onclick="queueLibraryCleanup(${library.id})">Queue Cleanup</button>
     <button class="button" onclick="queueLibraryTranscode(${library.id})">Queue Transcode</button>
     <button class="button" onclick="replaceLibrary(${library.id})">Replace Staged</button>
@@ -922,6 +923,58 @@ window.scanLibrary = async (libraryId) => {
   await refreshLibraries();
 };
 
+
+
+window.queueLibraryPilotRun = async (libraryId) => {
+  const maxInput = prompt('How many files should this pilot queue for this library?', '5');
+  if (maxInput === null) return;
+
+  const maxFiles = Math.max(1, Math.min(25, parseInt(maxInput, 10) || 5));
+  const stagingInput = prompt('Optional max estimated staging space in GB. Leave blank for no limit.', '');
+  if (stagingInput === null) return;
+
+  const stagingGb = stagingInput.trim() === '' ? null : Number(stagingInput);
+  if (stagingGb !== null && (!Number.isFinite(stagingGb) || stagingGb <= 0)) {
+    alert('Enter a positive staging size in GB, or leave it blank.');
+    return;
+  }
+
+  const request = {
+    maxFiles,
+    queueCleanup: true,
+    queueTranscode: true,
+    preferSmallFiles: true,
+    maxEstimatedStagingBytes: stagingGb === null ? null : Math.floor(stagingGb * 1024 * 1024 * 1024)
+  };
+
+  const limitText = stagingGb === null ? 'no staging size limit' : `max ${stagingGb} GB estimated staging`;
+  if (!confirm(`Queue a pilot run for up to ${maxFiles} file(s) using ${limitText}?
+
+This only queues cleanup/transcode jobs to staging. It will not replace originals.`)) return;
+
+  try {
+    const result = await api(`/api/libraries/${libraryId}/pilot-run`, { method: 'POST', body: JSON.stringify(request) });
+    const itemLines = (result.items || []).slice(0, 8).map(item =>
+      `- ${item.jobType}: ${item.relativePath} (${formatBytes(item.estimatedOutputSizeBytes)} staging, ${formatBytes(item.estimatedSavingBytes)} saving)`);
+    const more = (result.items || []).length > itemLines.length ? `
+- ...and ${(result.items || []).length - itemLines.length} more` : '';
+    alert([
+      ...(result.messages || []),
+      `Estimated staging: ${formatBytes(result.estimatedStagingBytes || 0)}`,
+      `Estimated saving: ${formatBytes(result.estimatedSavingBytes || 0)}`,
+      itemLines.length ? `Selected:
+${itemLines.join('
+')}${more}` : 'No files were selected. Check review approvals, plan status, or the staging limit.'
+    ].join('
+
+'));
+    await refreshLibraries();
+    await refreshMedia();
+    await refreshJobs();
+  } catch (error) {
+    alert(error.message || error);
+  }
+};
 
 window.queueLibraryCleanup = async (libraryId) => {
   if (!confirm('Queue Cleanup jobs for every approved cleanup plan in this library? Originals are untouched; outputs go to staging.')) return;

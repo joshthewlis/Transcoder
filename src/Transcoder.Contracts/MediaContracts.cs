@@ -96,6 +96,45 @@ public sealed class QueueLibraryWorkResultDto
 }
 
 
+
+public sealed class PilotRunRequestDto
+{
+    public int MaxFiles { get; set; } = 5;
+    public bool QueueCleanup { get; set; } = true;
+    public bool QueueTranscode { get; set; } = true;
+    public bool PreferSmallFiles { get; set; } = true;
+    public long? MaxEstimatedStagingBytes { get; set; }
+}
+
+public sealed class PilotRunQueuedItemDto
+{
+    public long MediaId { get; set; }
+    public string RelativePath { get; set; } = string.Empty;
+    public JobType JobType { get; set; }
+    public string PlanKind { get; set; } = string.Empty;
+    public long InputSizeBytes { get; set; }
+    public long? EstimatedOutputSizeBytes { get; set; }
+    public long? EstimatedSavingBytes { get; set; }
+    public bool Queued { get; set; }
+    public bool AlreadyQueued { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+
+public sealed class PilotRunResultDto
+{
+    public int LibraryId { get; set; }
+    public int MaxFiles { get; set; }
+    public long? MaxEstimatedStagingBytes { get; set; }
+    public int Considered { get; set; }
+    public int Queued { get; set; }
+    public int AlreadyQueued { get; set; }
+    public int Skipped { get; set; }
+    public long EstimatedStagingBytes { get; set; }
+    public long EstimatedSavingBytes { get; set; }
+    public List<PilotRunQueuedItemDto> Items { get; set; } = [];
+    public List<string> Messages { get; set; } = [];
+}
+
 public sealed class ReplaceMediaResultDto
 {
     public long MediaId { get; set; }
