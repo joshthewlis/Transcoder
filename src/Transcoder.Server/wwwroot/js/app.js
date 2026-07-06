@@ -962,12 +962,7 @@ This only queues cleanup/transcode jobs to staging. It will not replace original
       ...(result.messages || []),
       `Estimated staging: ${formatBytes(result.estimatedStagingBytes || 0)}`,
       `Estimated saving: ${formatBytes(result.estimatedSavingBytes || 0)}`,
-      itemLines.length ? `Selected:
-${itemLines.join('
-')}${more}` : 'No files were selected. Check review approvals, plan status, or the staging limit.'
-    ].join('
-
-'));
+      itemLines.length ? `Selected: ${itemLines.join('')}${more}` : 'No files were selected. Check review approvals, plan status, or the staging limit.'].join(''));
     await refreshLibraries();
     await refreshMedia();
     await refreshJobs();
