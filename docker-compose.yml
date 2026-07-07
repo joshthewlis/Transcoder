@@ -7,7 +7,7 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      ASPNETCORE_HTTP_PORTS: 5001
+      ASPNETCORE_URLS: http://0.0.0.0:5001
       ConnectionStrings__Transcoder: Data Source=/app/data/transcoder.db
       Transcoder__Security__AdminApiKey: dev-admin-key
       Transcoder__Security__WorkerApiKey: dev-worker-key
@@ -49,7 +49,7 @@ services:
       Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
-      - ./app-data/worker-probe:/work/transcoder
+      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
 
   transcoder-worker-probe-2:
     build:
@@ -77,4 +77,4 @@ services:
       Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
-      - ./app-data/worker-probe:/work/transcoder
+      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
