@@ -12,8 +12,8 @@ services:
       Transcoder__Security__AdminApiKey: dev-admin-key
       Transcoder__Security__WorkerApiKey: dev-worker-key
       Transcoder__Storage__TranscoderRoot: /mnt/.transcoder
-      Transcoder__Storage__WorkingRoot: /mnt/.transcoder/working
-      Transcoder__Storage__StagingRoot: /mnt/.transcoder/staging
+      Transcoder__Storage__WorkingRoot: /mnt/media/.transcoder/working
+      Transcoder__Storage__StagingRoot: /mnt/media/.transcoder/staging
       Transcoder__ActiveHours__Enabled: "true"
       Transcoder__ActiveHours__TimeZoneId: Europe/London
       Transcoder__ActiveHours__Start: "08:30"
