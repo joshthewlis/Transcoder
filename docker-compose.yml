@@ -6,9 +6,8 @@ services:
     container_name: transcoder-server
     network_mode: host
     restart: unless-stopped
-    ports:
-      - "5001:5000"
     environment:
+      ASPNETCORE_HTTP_PORTS: 5001
       ConnectionStrings__Transcoder: Data Source=/app/data/transcoder.db
       Transcoder__Security__AdminApiKey: dev-admin-key
       Transcoder__Security__WorkerApiKey: dev-worker-key
@@ -34,7 +33,7 @@ services:
     depends_on:
       - transcoder-server
     environment:
-      Transcoder__ServerUrl: http://transcoder-server:5000
+      Transcoder__ServerUrl: http://localhost:5001
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-1
       Transcoder__WorkerName: Probe Worker 1
@@ -62,7 +61,7 @@ services:
     depends_on:
       - transcoder-server
     environment:
-      Transcoder__ServerUrl: http://transcoder-server:5000
+      Transcoder__ServerUrl: http://localhost:5001
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-2
       Transcoder__WorkerName: Probe Worker 2
