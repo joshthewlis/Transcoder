@@ -64,33 +64,46 @@ public sealed class WorkerLoopService(
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            var heartbeat = await SendHeartbeatAsync(stoppingToken);
-            _controlState = heartbeat.ControlState;
-
-            if (await ApplyRuntimeSettingsAsync(stoppingToken))
-                heartbeat.PathCheckRequired = true;
-
-            if (heartbeat.PathCheckRequired)
-                await RunPathChecksAsync(heartbeat.PathChecks, stoppingToken);
-
-            if (heartbeat.AcceptNewWork && _controlState == WorkerControlState.Normal)
+            try
             {
-                var leaseResponse = await RequestAndStartWorkAsync(stoppingToken);
-                _controlState = leaseResponse.ControlState;
-                if (leaseResponse.RetryAfterSeconds > 0)
-                    _pollSeconds = leaseResponse.RetryAfterSeconds;
+                var heartbeat = await SendHeartbeatAsync(stoppingToken);
+                _controlState = heartbeat.ControlState;
 
-                if (leaseResponse.PathCheckRequired)
-                    await RunPathChecksAsync(leaseResponse.PathChecks, stoppingToken);
+                if (await ApplyRuntimeSettingsAsync(stoppingToken))
+                    heartbeat.PathCheckRequired = true;
 
-                TrackIdleState(leaseResponse.Leases.Count == 0 && _activeJobs.IsEmpty, leaseResponse.ControlState, stoppingToken);
+                if (heartbeat.PathCheckRequired)
+                    await RunPathChecksAsync(heartbeat.PathChecks, stoppingToken);
+
+                if (heartbeat.AcceptNewWork && _controlState == WorkerControlState.Normal)
+                {
+                    var leaseResponse = await RequestAndStartWorkAsync(stoppingToken);
+                    _controlState = leaseResponse.ControlState;
+                    if (leaseResponse.RetryAfterSeconds > 0)
+                        _pollSeconds = leaseResponse.RetryAfterSeconds;
+
+                    if (leaseResponse.PathCheckRequired)
+                        await RunPathChecksAsync(leaseResponse.PathChecks, stoppingToken);
+
+                    TrackIdleState(leaseResponse.Leases.Count == 0 && _activeJobs.IsEmpty, leaseResponse.ControlState, stoppingToken);
+                }
+                else
+                {
+                    TrackIdleState(_activeJobs.IsEmpty, _controlState, stoppingToken);
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(_pollSeconds), stoppingToken);
             }
-            else
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                TrackIdleState(_activeJobs.IsEmpty, _controlState, stoppingToken);
+                break;
             }
-
-            await Task.Delay(TimeSpan.FromSeconds(_pollSeconds), stoppingToken);
+            catch (Exception ex)
+            {
+                var retrySeconds = Math.Max(5, _pollSeconds);
+                logger.LogError(ex, "Worker loop failed; keeping worker alive and retrying in {RetrySeconds} seconds.", retrySeconds);
+                await Task.Delay(TimeSpan.FromSeconds(retrySeconds), stoppingToken);
+            }
         }
     }
 
@@ -336,6 +349,15 @@ public sealed class WorkerLoopService(
                 {
                     await RunJobAsync(lease, cancellationToken);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // Normal worker shutdown.
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Unhandled job task failure for job {JobId}; worker will continue.", lease.JobId);
+                    await TryReportJobFailureAsync(lease, ex, CancellationToken.None);
+                }
                 finally
                 {
                     _activeJobs.TryRemove(lease.JobId, out _);
@@ -397,20 +419,20 @@ public sealed class WorkerLoopService(
                     await RunTranscodeJobAsync(lease, cancellationToken);
                     break;
                 default:
-                    await api.FailJobAsync(lease.JobId, new JobFailRequest
-                    {
-                        WorkerId = _options.WorkerId,
-                        WorkerInstanceId = _instanceId,
-                        LeaseId = lease.LeaseId,
-                        ErrorCode = "JobTypeNotImplemented",
-                        Message = $"Worker job type {lease.JobType} is not implemented in this initial pass."
-                    }, cancellationToken);
-                    break;
+                    throw new NotSupportedException($"Worker job type {lease.JobType} is not implemented in this worker.");
             }
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Job {JobId} failed", lease.JobId);
+            await TryReportJobFailureAsync(lease, ex, cancellationToken.IsCancellationRequested ? CancellationToken.None : cancellationToken);
+        }
+    }
+
+    private async Task TryReportJobFailureAsync(JobLeaseDto lease, Exception ex, CancellationToken cancellationToken)
+    {
+        try
+        {
             await api.FailJobAsync(lease.JobId, new JobFailRequest
             {
                 WorkerId = _options.WorkerId,
@@ -420,6 +442,10 @@ public sealed class WorkerLoopService(
                 Message = ex.Message,
                 Details = ex.ToString()
             }, cancellationToken);
+        }
+        catch (Exception reportEx)
+        {
+            logger.LogError(reportEx, "Could not report failure for job {JobId}; worker will continue.", lease.JobId);
         }
     }
 

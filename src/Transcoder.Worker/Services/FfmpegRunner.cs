@@ -7,6 +7,8 @@ namespace Transcoder.Worker.Services;
 
 public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<FfmpegRunner> logger)
 {
+    private const int MaxStoredLogCharacters = 256 * 1024;
+    private const int MaxFailureLogCharacters = 12 * 1024;
     private readonly WorkerOptions _options = options.Value;
 
     public async Task<FfmpegRunResult> RunAsync(
@@ -41,7 +43,7 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
             });
         }
 
-        var log = new StringBuilder();
+        var log = new BoundedLogBuffer(MaxStoredLogCharacters);
         var started = DateTime.UtcNow;
         progress?.Invoke(1, "Starting ffmpeg");
 
@@ -66,14 +68,16 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         process.BeginErrorReadLine();
         process.BeginOutputReadLine();
         await process.WaitForExitAsync(cancellationToken);
+        process.WaitForExit();
 
         var elapsed = DateTime.UtcNow - started;
         var logText = log.ToString();
 
         if (process.ExitCode != 0)
         {
-            logger.LogWarning("ffmpeg failed with exit code {ExitCode}: {Log}", process.ExitCode, Tail(logText, 4000));
-            throw new InvalidOperationException($"ffmpeg failed with exit code {process.ExitCode}: {Tail(logText, 4000)}");
+            var failureLog = Tail(logText, MaxFailureLogCharacters);
+            logger.LogWarning("ffmpeg failed with exit code {ExitCode}: {Log}", process.ExitCode, failureLog);
+            throw new InvalidOperationException($"ffmpeg failed with exit code {process.ExitCode}: {failureLog}");
         }
 
         progress?.Invoke(95, "ffmpeg complete");
@@ -96,6 +100,26 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
     {
         if (value.Length <= length) return value;
         return value[^length..];
+    }
+
+    private sealed class BoundedLogBuffer
+    {
+        private readonly int _maxCharacters;
+        private readonly StringBuilder _builder = new();
+
+        public BoundedLogBuffer(int maxCharacters)
+        {
+            _maxCharacters = Math.Max(1024, maxCharacters);
+        }
+
+        public void AppendLine(string line)
+        {
+            _builder.AppendLine(line);
+            if (_builder.Length > _maxCharacters)
+                _builder.Remove(0, _builder.Length - _maxCharacters);
+        }
+
+        public override string ToString() => _builder.ToString();
     }
 }
 

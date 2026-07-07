@@ -4,8 +4,10 @@ services:
       context: .
       dockerfile: docker/server/Dockerfile
     container_name: transcoder-server
+    network_mode: host
+    restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "5001:5000"
     environment:
       ConnectionStrings__Transcoder: Data Source=/app/data/transcoder.db
       Transcoder__Security__AdminApiKey: dev-admin-key
@@ -22,11 +24,13 @@ services:
       - ./app-data/server:/app/data
       - /mnt:/mnt
 
-  transcoder-worker-probe:
+  transcoder-worker-probe-1:
     build:
       context: .
       dockerfile: docker/worker/Dockerfile
-    container_name: transcoder-worker-probe
+    container_name: transcoder-worker-probe-1
+    network_mode: host
+    restart: unless-stopped
     depends_on:
       - transcoder-server
     environment:
@@ -42,10 +46,64 @@ services:
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
-      Transcoder__PathMappings__0__ServerPrefix: /mnt/movies
-      Transcoder__PathMappings__0__WorkerPrefix: /mnt/movies
-      Transcoder__PathMappings__1__ServerPrefix: /mnt/.transcoder
-      Transcoder__PathMappings__1__WorkerPrefix: /mnt/.transcoder
+      Transcoder__PathMappings__0__ServerPrefix: /mnt/media
+      Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
+    volumes:
+      - /mnt:/mnt
+      - ./app-data/worker-probe:/work/transcoder
+
+  transcoder-worker-probe-2:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    container_name: transcoder-worker-probe-2
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - transcoder-server
+    environment:
+      Transcoder__ServerUrl: http://transcoder-server:5000
+      Transcoder__ApiKey: dev-worker-key
+      Transcoder__WorkerId: probe-worker-2
+      Transcoder__WorkerName: Probe Worker 2
+      Transcoder__Roles: Prober
+      Transcoder__Limits__MaxProbeJobs: 10
+      Transcoder__Limits__MaxPlanReviewJobs: 10
+      Transcoder__Limits__MaxTranscodeJobs: 0
+      Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__LocalWorkingRoot: /work/transcoder
+      Transcoder__AutoCreateLocalWorkingRoot: "true"
+      Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
+      Transcoder__PathMappings__0__ServerPrefix: /mnt/media
+      Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
+    volumes:
+      - /mnt:/mnt
+      - ./app-data/worker-probe:/work/transcoder
+
+  transcoder-worker-probe-3:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    container_name: transcoder-worker-probe-3
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - transcoder-server
+    environment:
+      Transcoder__ServerUrl: http://transcoder-server:5000
+      Transcoder__ApiKey: dev-worker-key
+      Transcoder__WorkerId: probe-worker-3
+      Transcoder__WorkerName: Probe Worker 3
+      Transcoder__Roles: Prober
+      Transcoder__Limits__MaxProbeJobs: 10
+      Transcoder__Limits__MaxPlanReviewJobs: 10
+      Transcoder__Limits__MaxTranscodeJobs: 0
+      Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__LocalWorkingRoot: /work/transcoder
+      Transcoder__AutoCreateLocalWorkingRoot: "true"
+      Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
+      Transcoder__PathMappings__0__ServerPrefix: /mnt/media
+      Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
       - ./app-data/worker-probe:/work/transcoder
