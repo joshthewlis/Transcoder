@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
@@ -582,13 +583,16 @@ public sealed class WorkerLoopService(
         var localOutputPath = Path.Combine(jobWorkRoot, "output" + extension);
         var logPath = Path.Combine(jobWorkRoot, "ffmpeg.log");
 
+        var inputDurationSeconds = await GetInputDurationSecondsAsync(lease.Payload, localInputPath, cancellationToken);
+
         UpdateActiveJob(lease.JobId, 1, lease.JobType == JobType.Cleanup ? "Remuxing cleanup to local scratch" : "Encoding to local scratch");
         var runResult = await ffmpeg.RunAsync(
             ffmpegArgs,
             localInputPath,
             localOutputPath,
             (progress, message) => UpdateActiveJob(lease.JobId, progress, message),
-            cancellationToken);
+            cancellationToken,
+            inputDurationSeconds);
 
         await File.WriteAllTextAsync(logPath, runResult.LogText, cancellationToken);
 
@@ -659,6 +663,92 @@ public sealed class WorkerLoopService(
             LeaseId = lease.LeaseId,
             Result = result
         }, cancellationToken);
+    }
+
+    private async Task<double?> GetInputDurationSecondsAsync(JsonElement payload, string localInputPath, CancellationToken cancellationToken)
+    {
+        var payloadDuration = TryReadDurationSeconds(payload);
+        if (payloadDuration is > 0)
+            return payloadDuration;
+
+        try
+        {
+            var probeJson = await ffprobe.ProbeAsync(localInputPath, cancellationToken);
+            return TryReadDurationSeconds(probeJson);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Could not read input duration for ffmpeg progress from {Path}.", localInputPath);
+            return null;
+        }
+    }
+
+    private static double? TryReadDurationSeconds(string probeJson)
+    {
+        if (string.IsNullOrWhiteSpace(probeJson))
+            return null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(probeJson);
+            return TryReadDurationSeconds(document.RootElement);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static double? TryReadDurationSeconds(JsonElement element)
+    {
+        if (TryGetPositiveDouble(element, "durationSeconds", out var directDuration))
+            return directDuration;
+
+        if (element.TryGetProperty("format", out var format) && TryGetPositiveDouble(format, "duration", out var formatDuration))
+            return formatDuration;
+
+        if (element.TryGetProperty("probeJson", out var probeJson))
+        {
+            var probeDuration = probeJson.ValueKind == JsonValueKind.String
+                ? TryReadDurationSeconds(probeJson.GetString() ?? string.Empty)
+                : TryReadDurationSeconds(probeJson);
+
+            if (probeDuration is > 0)
+                return probeDuration;
+        }
+
+        if (element.TryGetProperty("planJson", out var planJson) && TryReadDurationSeconds(planJson) is { } planDuration)
+            return planDuration;
+
+        if (element.TryGetProperty("streams", out var streams) && streams.ValueKind == JsonValueKind.Array)
+        {
+            var streamDurations = streams.EnumerateArray()
+                .Select(stream => TryGetPositiveDouble(stream, "duration", out var duration) ? duration : (double?)null)
+                .Where(duration => duration is > 0)
+                .Select(duration => duration!.Value)
+                .ToList();
+
+            if (streamDurations.Count > 0)
+                return streamDurations.Max();
+        }
+
+        return null;
+    }
+
+    private static bool TryGetPositiveDouble(JsonElement element, string propertyName, out double value)
+    {
+        value = 0;
+
+        if (!element.TryGetProperty(propertyName, out var property))
+            return false;
+
+        if (property.ValueKind == JsonValueKind.Number && property.TryGetDouble(out value))
+            return value > 0;
+
+        if (property.ValueKind == JsonValueKind.String && double.TryParse(property.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            return value > 0;
+
+        return false;
     }
 
     private static void TryDeleteDirectory(string path)

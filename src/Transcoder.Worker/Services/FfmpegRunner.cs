@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Options;
 using Transcoder.Worker.Configuration;
 
@@ -16,7 +18,8 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         string inputPath,
         string outputPath,
         Action<double?, string>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        double? inputDurationSeconds = null)
     {
         if (plannedArgs.Count == 0)
             throw new InvalidOperationException("FFmpeg plan contains no arguments.");
@@ -52,9 +55,9 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         {
             if (e.Data is null) return;
             lock (log) log.AppendLine(e.Data);
-            var message = BuildProgressMessage(e.Data);
-            if (!string.IsNullOrWhiteSpace(message))
-                progress?.Invoke(null, message);
+            var update = BuildProgressUpdate(e.Data, inputDurationSeconds);
+            if (update is not null)
+                progress?.Invoke(update.Progress, update.Message);
         };
         process.OutputDataReceived += (_, e) =>
         {
@@ -84,16 +87,34 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         return new FfmpegRunResult(process.ExitCode, elapsed, logText);
     }
 
-    private static string? BuildProgressMessage(string line)
+    private static FfmpegProgressUpdate? BuildProgressUpdate(string line, double? inputDurationSeconds)
     {
-        if (line.Contains("frame=", StringComparison.OrdinalIgnoreCase) ||
-            line.Contains("time=", StringComparison.OrdinalIgnoreCase) ||
-            line.Contains("speed=", StringComparison.OrdinalIgnoreCase))
+        if (!line.Contains("frame=", StringComparison.OrdinalIgnoreCase) &&
+            !line.Contains("time=", StringComparison.OrdinalIgnoreCase) &&
+            !line.Contains("speed=", StringComparison.OrdinalIgnoreCase))
         {
-            return line.Trim();
+            return null;
         }
 
-        return null;
+        var message = line.Trim();
+        var progress = TryCalculatePercentFromTimestamp(message, inputDurationSeconds);
+        return new FfmpegProgressUpdate(progress, message);
+    }
+
+    private static double? TryCalculatePercentFromTimestamp(string line, double? inputDurationSeconds)
+    {
+        if (inputDurationSeconds is null || inputDurationSeconds.Value <= 0)
+            return null;
+
+        var match = Regex.Match(line, @"(?:^|\s)time=(?<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success)
+            return null;
+
+        if (!TimeSpan.TryParse(match.Groups["time"].Value, CultureInfo.InvariantCulture, out var current))
+            return null;
+
+        var percent = current.TotalSeconds / inputDurationSeconds.Value * 100d;
+        return Math.Clamp(percent, 1d, 94d);
     }
 
     private static string Tail(string value, int length)
@@ -101,6 +122,8 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         if (value.Length <= length) return value;
         return value[^length..];
     }
+
+    private sealed record FfmpegProgressUpdate(double? Progress, string Message);
 
     private sealed class BoundedLogBuffer
     {
