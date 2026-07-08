@@ -11,9 +11,10 @@ services:
       ConnectionStrings__Transcoder: Data Source=/app/data/transcoder.db
       Transcoder__Security__AdminApiKey: dev-admin-key
       Transcoder__Security__WorkerApiKey: dev-worker-key
-      Transcoder__Storage__TranscoderRoot: /mnt/.transcoder
+      Transcoder__Storage__TranscoderRoot: /mnt/media/.transcoder
       Transcoder__Storage__WorkingRoot: /mnt/media/.transcoder/working
       Transcoder__Storage__StagingRoot: /mnt/media/.transcoder/staging
+      Transcoder__Storage__KeepOriginalsQuarantine: "false"
       Transcoder__ActiveHours__Enabled: "true"
       Transcoder__ActiveHours__TimeZoneId: Europe/London
       Transcoder__ActiveHours__Start: "08:30"
@@ -37,7 +38,7 @@ services:
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-1
       Transcoder__WorkerName: Probe Worker 1
-      Transcoder__Roles: Prober
+      Transcoder__Roles: Prober, Transcoder, Validator
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
@@ -65,7 +66,35 @@ services:
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-2
       Transcoder__WorkerName: Probe Worker 2
-      Transcoder__Roles: Prober
+      Transcoder__Roles: Prober, Transcoder, Validator
+      Transcoder__Limits__MaxProbeJobs: 10
+      Transcoder__Limits__MaxPlanReviewJobs: 10
+      Transcoder__Limits__MaxTranscodeJobs: 0
+      Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__LocalWorkingRoot: /work/transcoder
+      Transcoder__AutoCreateLocalWorkingRoot: "true"
+      Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
+      Transcoder__PathMappings__0__ServerPrefix: /mnt/media
+      Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
+    volumes:
+      - /mnt:/mnt
+      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
+
+  transcoder-worker-probe-3:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    container_name: transcoder-worker-probe-3
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - transcoder-server
+    environment:
+      Transcoder__ServerUrl: http://localhost:5001
+      Transcoder__ApiKey: dev-worker-key
+      Transcoder__WorkerId: probe-worker-3
+      Transcoder__WorkerName: Probe Worker 3
+      Transcoder__Roles: Prober, Transcoder, Validator
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
