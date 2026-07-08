@@ -55,7 +55,7 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         {
             if (e.Data is null) return;
             lock (log) log.AppendLine(e.Data);
-            var update = BuildProgressUpdate(e.Data, inputDurationSeconds);
+            var update = BuildProgressUpdate(e.Data, inputDurationSeconds, DateTime.UtcNow - started);
             if (update is not null)
                 progress?.Invoke(update.Progress, update.Message);
         };
@@ -87,7 +87,7 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         return new FfmpegRunResult(process.ExitCode, elapsed, logText);
     }
 
-    private static FfmpegProgressUpdate? BuildProgressUpdate(string line, double? inputDurationSeconds)
+    private static FfmpegProgressUpdate? BuildProgressUpdate(string line, double? inputDurationSeconds, TimeSpan elapsed)
     {
         if (!line.Contains("frame=", StringComparison.OrdinalIgnoreCase) &&
             !line.Contains("time=", StringComparison.OrdinalIgnoreCase) &&
@@ -97,24 +97,81 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         }
 
         var message = line.Trim();
-        var progress = TryCalculatePercentFromTimestamp(message, inputDurationSeconds);
+        var currentSeconds = TryParseFfmpegTimestampSeconds(message);
+        var progress = TryCalculatePercentFromTimestamp(currentSeconds, inputDurationSeconds);
+        var eta = TryCalculateEta(currentSeconds, inputDurationSeconds, TryParseFfmpegSpeed(message), elapsed);
+
+        if (eta is not null)
+            message = $"{message} eta={FormatDuration(eta.Value)}";
+
         return new FfmpegProgressUpdate(progress, message);
     }
 
-    private static double? TryCalculatePercentFromTimestamp(string line, double? inputDurationSeconds)
+    private static double? TryCalculatePercentFromTimestamp(double? currentSeconds, double? inputDurationSeconds)
     {
-        if (inputDurationSeconds is null || inputDurationSeconds.Value <= 0)
+        if (currentSeconds is null || currentSeconds.Value <= 0 || inputDurationSeconds is null || inputDurationSeconds.Value <= 0)
             return null;
 
+        var percent = currentSeconds.Value / inputDurationSeconds.Value * 100d;
+        return Math.Clamp(percent, 1d, 94d);
+    }
+
+    private static double? TryParseFfmpegTimestampSeconds(string line)
+    {
         var match = Regex.Match(line, @"(?:^|\s)time=(?<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         if (!match.Success)
             return null;
 
-        if (!TimeSpan.TryParse(match.Groups["time"].Value, CultureInfo.InvariantCulture, out var current))
+        return TimeSpan.TryParse(match.Groups["time"].Value, CultureInfo.InvariantCulture, out var current)
+            ? current.TotalSeconds
+            : null;
+    }
+
+    private static double? TryParseFfmpegSpeed(string line)
+    {
+        var match = Regex.Match(line, @"(?:^|\s)speed=\s*(?<speed>[0-9]+(?:\.[0-9]+)?)x", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!match.Success)
             return null;
 
-        var percent = current.TotalSeconds / inputDurationSeconds.Value * 100d;
-        return Math.Clamp(percent, 1d, 94d);
+        if (!double.TryParse(match.Groups["speed"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var speed))
+            return null;
+
+        return speed > 0 ? speed : null;
+    }
+
+    private static TimeSpan? TryCalculateEta(double? currentSeconds, double? inputDurationSeconds, double? ffmpegSpeed, TimeSpan elapsed)
+    {
+        if (currentSeconds is null || currentSeconds.Value <= 0 || inputDurationSeconds is null || inputDurationSeconds.Value <= 0)
+            return null;
+
+        var remainingMediaSeconds = inputDurationSeconds.Value - currentSeconds.Value;
+        if (remainingMediaSeconds <= 0)
+            return TimeSpan.Zero;
+
+        var effectiveSpeed = ffmpegSpeed is > 0
+            ? ffmpegSpeed.Value
+            : elapsed.TotalSeconds > 0
+                ? currentSeconds.Value / elapsed.TotalSeconds
+                : 0;
+
+        if (effectiveSpeed <= 0)
+            return null;
+
+        return TimeSpan.FromSeconds(remainingMediaSeconds / effectiveSpeed);
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+            duration = TimeSpan.Zero;
+
+        if (duration.TotalHours >= 1)
+            return $"~{(int)duration.TotalHours}h {duration.Minutes}m";
+
+        if (duration.TotalMinutes >= 1)
+            return $"~{duration.Minutes}m {duration.Seconds}s";
+
+        return $"~{Math.Max(0, duration.Seconds)}s";
     }
 
     private static string Tail(string value, int length)
