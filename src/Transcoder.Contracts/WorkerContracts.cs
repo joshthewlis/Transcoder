@@ -206,7 +206,10 @@ public sealed class ActiveWorkerJobDto
     public JobType JobType { get; set; }
     public JobStatus Status { get; set; }
     public int? LibraryId { get; set; }
+    public string? LibraryName { get; set; }
     public long? MediaItemId { get; set; }
+    public string? MediaName { get; set; }
+    public string? MediaRelativePath { get; set; }
     public double? Progress { get; set; }
     public string? Message { get; set; }
     public DateTime? StartedUtc { get; set; }

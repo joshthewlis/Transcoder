@@ -194,7 +194,26 @@ public sealed class WorkersController(
             .GroupBy(x => x.LeasedByWorkerId!)
             .ToDictionary(x => x.Key, x => x.ToList());
 
-        return workers.Select(worker => ToDto(worker, activeByWorker.TryGetValue(worker.WorkerId, out var jobs) ? jobs : [])).ToList();
+        var libraryIds = activeJobs.Select(x => x.LibraryId).OfType<int>().Distinct().ToList();
+        var mediaIds = activeJobs.Select(x => x.MediaItemId).OfType<long>().Distinct().ToList();
+
+        var libraries = libraryIds.Count == 0
+            ? new Dictionary<int, string>()
+            : await db.Libraries.AsNoTracking()
+                .Where(x => libraryIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.Name, cancellationToken);
+
+        var mediaItems = mediaIds.Count == 0
+            ? new Dictionary<long, MediaItemEntity>()
+            : await db.MediaItems.AsNoTracking()
+                .Where(x => mediaIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, cancellationToken);
+
+        return workers.Select(worker => ToDto(
+            worker,
+            activeByWorker.TryGetValue(worker.WorkerId, out var jobs) ? jobs : [],
+            libraries,
+            mediaItems)).ToList();
     }
 
     [HttpGet("{workerId}")]
@@ -208,7 +227,22 @@ public sealed class WorkersController(
             .OrderBy(x => x.LeaseStartedUtc)
             .ToListAsync(cancellationToken);
 
-        return ToDto(worker, activeJobs);
+        var libraryIds = activeJobs.Select(x => x.LibraryId).OfType<int>().Distinct().ToList();
+        var mediaIds = activeJobs.Select(x => x.MediaItemId).OfType<long>().Distinct().ToList();
+
+        var libraries = libraryIds.Count == 0
+            ? new Dictionary<int, string>()
+            : await db.Libraries.AsNoTracking()
+                .Where(x => libraryIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.Name, cancellationToken);
+
+        var mediaItems = mediaIds.Count == 0
+            ? new Dictionary<long, MediaItemEntity>()
+            : await db.MediaItems.AsNoTracking()
+                .Where(x => mediaIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, cancellationToken);
+
+        return ToDto(worker, activeJobs, libraries, mediaItems);
     }
 
 
@@ -418,7 +452,11 @@ public sealed class WorkersController(
         return match.Success ? match.Groups["version"].Value : null;
     }
 
-    private static WorkerDto ToDto(WorkerEntity entity, IReadOnlyCollection<JobEntity> activeJobs)
+    private static WorkerDto ToDto(
+        WorkerEntity entity,
+        IReadOnlyCollection<JobEntity> activeJobs,
+        IReadOnlyDictionary<int, string> libraries,
+        IReadOnlyDictionary<long, MediaItemEntity> mediaItems)
     {
         WorkerCapabilitiesDto? capabilities = null;
         WorkerLocalStorageDto? localStorage = null;
@@ -450,20 +488,35 @@ public sealed class WorkersController(
             // Ignore malformed legacy path mapping JSON.
         }
 
-        var active = activeJobs.Select(job => new ActiveWorkerJobDto
+        var active = activeJobs.Select(job =>
         {
-            JobId = job.Id,
-            JobType = job.JobType,
-            Status = job.Status,
-            LibraryId = job.LibraryId,
-            MediaItemId = job.MediaItemId,
-            Progress = job.Progress,
-            Message = job.LastMessage,
-            StartedUtc = job.LeaseStartedUtc,
-            LastSeenUtc = job.LeaseLastSeenUtc
+            MediaItemEntity? media = null;
+            if (job.MediaItemId is not null)
+                mediaItems.TryGetValue(job.MediaItemId.Value, out media);
+
+            string? libraryName = null;
+            if (job.LibraryId is not null)
+                libraries.TryGetValue(job.LibraryId.Value, out libraryName);
+
+            return new ActiveWorkerJobDto
+            {
+                JobId = job.Id,
+                JobType = job.JobType,
+                Status = job.Status,
+                LibraryId = job.LibraryId,
+                LibraryName = libraryName,
+                MediaItemId = job.MediaItemId,
+                MediaName = media is null ? null : GetDisplayName(media.RelativePath),
+                MediaRelativePath = media?.RelativePath,
+                Progress = job.Progress,
+                Message = job.LastMessage,
+                StartedUtc = job.LeaseStartedUtc,
+                LastSeenUtc = job.LeaseLastSeenUtc
+            };
         }).ToList();
 
         var isIdle = active.Count == 0;
+
         return new WorkerDto
         {
             WorkerId = entity.WorkerId,
@@ -484,5 +537,13 @@ public sealed class WorkersController(
             IsIdle = isIdle,
             SafeToStop = isIdle && entity.ControlState != WorkerControlState.Normal
         };
+    }
+
+    private static string GetDisplayName(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return string.Empty;
+        var normalized = path.Replace('\\', '/').TrimEnd('/');
+        var index = normalized.LastIndexOf('/');
+        return index >= 0 ? normalized[(index + 1)..] : normalized;
     }
 }

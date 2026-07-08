@@ -602,9 +602,15 @@ function renderWorkerActivity(worker) {
 
   return activeJobs.map(job => {
     const progress = job.progress == null ? '' : ` · ${Math.round(job.progress)}%`;
-    const media = job.mediaItemId ? ` · media ${job.mediaItemId}` : '';
+    const mediaName = job.mediaName || (job.mediaRelativePath ? job.mediaRelativePath.split(/[\/]/).pop() : '');
+    const media = mediaName
+      ? ` · ${escapeHtml(mediaName)}`
+      : job.mediaItemId
+        ? ` · media ${job.mediaItemId}`
+        : '';
+    const title = job.mediaRelativePath ? ` title="${escapeAttribute(job.mediaRelativePath)}"` : '';
     const message = job.message ? `<small>${escapeHtml(job.message)}</small>` : '';
-    return `<div class="worker-job">${badge(job.jobType)} <span>#${job.jobId}${media}${progress}</span>${message}</div>`;
+    return `<div class="worker-job"${title}>${badge(job.jobType)} <span>#${job.jobId}${media}${progress}</span>${message}</div>`;
   }).join('');
 }
 
