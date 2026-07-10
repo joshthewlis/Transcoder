@@ -30,6 +30,7 @@ public sealed class WorkerLoopService(
     private int _pollSeconds = 10;
     private DateTime? _idleSinceUtc;
     private readonly ConcurrentDictionary<long, ActiveJobState> _activeJobs = new();
+    private readonly SemaphoreSlim _stagingCopySlots = new(Math.Max(1, options.Value.StagingCopy.MaxConcurrentCopies), Math.Max(1, options.Value.StagingCopy.MaxConcurrentCopies));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -369,16 +370,29 @@ public sealed class WorkerLoopService(
         return response;
     }
 
-    private WorkerCapacityDto BuildAvailableCapacity() => new()
+    private WorkerCapacityDto BuildAvailableCapacity()
     {
-        Probe = Math.Max(0, _options.Limits.MaxProbeJobs - CountActive(JobType.Probe)),
-        PlanReview = Math.Max(0, _options.Limits.MaxPlanReviewJobs - CountActive(JobType.PlanReview)),
-        Cleanup = Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup)),
-        Transcode = Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode)),
-        Validation = Math.Max(0, _options.Limits.MaxValidationJobs - CountActive(JobType.ValidateOutput))
-    };
+        var stagingBacklogFull = IsStagingCopyBacklogFull();
+        return new WorkerCapacityDto
+        {
+            Probe = Math.Max(0, _options.Limits.MaxProbeJobs - CountActive(JobType.Probe)),
+            PlanReview = Math.Max(0, _options.Limits.MaxPlanReviewJobs - CountActive(JobType.PlanReview)),
+            Cleanup = stagingBacklogFull ? 0 : Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup)),
+            Transcode = stagingBacklogFull ? 0 : Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode)),
+            Validation = Math.Max(0, _options.Limits.MaxValidationJobs - CountActive(JobType.ValidateOutput))
+        };
+    }
 
     private int CountActive(JobType jobType) => _activeJobs.Values.Count(x => x.JobType == jobType);
+
+    private int CountStagingCopyBacklog()
+        => _activeJobs.Values.Count(x => x.WaitingForStagingCopy || x.CopyingToStaging);
+
+    private bool IsStagingCopyBacklogFull()
+    {
+        var maxBuffered = _options.StagingCopy.MaxBufferedLocalOutputs;
+        return maxBuffered > 0 && CountStagingCopyBacklog() >= maxBuffered;
+    }
 
     private List<JobLeaseRequestItemDto> BuildLeaseRequests()
     {
@@ -608,24 +622,14 @@ public sealed class WorkerLoopService(
         var stagingCompleteMarkerPath = stagingOutputPath + ".complete.json";
         if (File.Exists(stagingPartialPath)) File.Delete(stagingPartialPath);
 
-        UpdateActiveJob(lease.JobId, 98, "Copying to staging partial file");
-        File.Copy(localOutputPath, stagingPartialPath, overwrite: true);
-
-        UpdateActiveJob(lease.JobId, 99, "Validating staged partial output");
-        await ffprobe.ProbeAsync(stagingPartialPath, cancellationToken);
-
-        if (File.Exists(localStagingOutputPath)) File.Delete(localStagingOutputPath);
-        File.Move(stagingPartialPath, localStagingOutputPath);
-
-        await File.WriteAllTextAsync(localStagingCompleteMarkerPath, JsonSerializer.Serialize(new
-        {
-            jobId = lease.JobId,
-            leaseId = lease.LeaseId,
-            jobType = lease.JobType.ToString(),
-            operation = operationName,
-            completedUtc = DateTime.UtcNow,
-            outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length
-        }, _jsonOptions), cancellationToken);
+        await CopyLocalOutputToStagingAsync(
+            lease,
+            operationName,
+            localOutputPath,
+            stagingPartialPath,
+            localStagingOutputPath,
+            localStagingCompleteMarkerPath,
+            cancellationToken);
 
         var outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length;
         var inputFileSizeBytes = new FileInfo(localInputPath).Length;
@@ -663,6 +667,72 @@ public sealed class WorkerLoopService(
             LeaseId = lease.LeaseId,
             Result = result
         }, cancellationToken);
+    }
+
+
+    private async Task CopyLocalOutputToStagingAsync(
+        JobLeaseDto lease,
+        string operationName,
+        string localOutputPath,
+        string stagingPartialPath,
+        string localStagingOutputPath,
+        string localStagingCompleteMarkerPath,
+        CancellationToken cancellationToken)
+    {
+        MarkStagingCopyState(lease.JobId, waiting: true, copying: false);
+        UpdateActiveJob(lease.JobId, 97, $"Waiting for staging copy slot ({CountStagingCopyBacklog()}/{Math.Max(1, _options.StagingCopy.MaxBufferedLocalOutputs)} local outputs waiting/copying)");
+
+        await _stagingCopySlots.WaitAsync(cancellationToken);
+        try
+        {
+            MarkStagingCopyState(lease.JobId, waiting: false, copying: true);
+
+            if (File.Exists(stagingPartialPath))
+                File.Delete(stagingPartialPath);
+
+            UpdateActiveJob(lease.JobId, 98, $"Copying to staging ({CountStagingCopyBacklog()} local output(s) waiting/copying)");
+            await CopyFileAsync(localOutputPath, stagingPartialPath, cancellationToken);
+
+            UpdateActiveJob(lease.JobId, 99, "Validating staged partial output");
+            await ffprobe.ProbeAsync(stagingPartialPath, cancellationToken);
+
+            if (File.Exists(localStagingOutputPath))
+                File.Delete(localStagingOutputPath);
+
+            File.Move(stagingPartialPath, localStagingOutputPath);
+
+            await File.WriteAllTextAsync(localStagingCompleteMarkerPath, JsonSerializer.Serialize(new
+            {
+                jobId = lease.JobId,
+                leaseId = lease.LeaseId,
+                jobType = lease.JobType.ToString(),
+                operation = operationName,
+                completedUtc = DateTime.UtcNow,
+                outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length
+            }, _jsonOptions), cancellationToken);
+        }
+        finally
+        {
+            MarkStagingCopyState(lease.JobId, waiting: false, copying: false);
+            _stagingCopySlots.Release();
+        }
+    }
+
+    private static async Task CopyFileAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
+    {
+        const int bufferSize = 1024 * 1024;
+        await using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, useAsync: true);
+        await using var destination = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, useAsync: true);
+        await source.CopyToAsync(destination, bufferSize, cancellationToken);
+    }
+
+    private void MarkStagingCopyState(long jobId, bool waiting, bool copying)
+    {
+        if (_activeJobs.TryGetValue(jobId, out var active))
+        {
+            active.WaitingForStagingCopy = waiting;
+            active.CopyingToStaging = copying;
+        }
     }
 
     private async Task<double?> GetInputDurationSecondsAsync(JsonElement payload, string localInputPath, CancellationToken cancellationToken)
@@ -841,5 +911,7 @@ public sealed class WorkerLoopService(
         public string? Message { get; set; }
         public double? Fps { get; set; }
         public int? EtaSeconds { get; set; }
+        public bool WaitingForStagingCopy { get; set; }
+        public bool CopyingToStaging { get; set; }
     }
 }

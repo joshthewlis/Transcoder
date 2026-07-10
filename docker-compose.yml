@@ -43,6 +43,8 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__StagingCopy__MaxConcurrentCopies: 1
+      Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
@@ -50,7 +52,7 @@ services:
       Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
-      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
+      - /mnt/transcoder-scratch:/work/transcoder
 
   transcoder-worker-probe-2:
     build:
@@ -71,6 +73,8 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__StagingCopy__MaxConcurrentCopies: 1
+      Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
@@ -78,7 +82,7 @@ services:
       Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
-      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
+      - /mnt/transcoder-scratch:/work/transcoder
 
   transcoder-worker-probe-3:
     build:
@@ -99,6 +103,8 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+      Transcoder__StagingCopy__MaxConcurrentCopies: 1
+      Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
@@ -106,4 +112,4 @@ services:
       Transcoder__PathMappings__0__WorkerPrefix: /mnt/media
     volumes:
       - /mnt:/mnt
-      - /mnt/transcoder-scratch:/work/transcoder:/work/transcoder
+      - /mnt/transcoder-scratch:/work/transcoder

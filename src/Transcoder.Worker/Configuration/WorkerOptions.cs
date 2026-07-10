@@ -17,6 +17,7 @@ public sealed class WorkerOptions
     public bool KeepLocalJobFilesOnSuccess { get; set; }
     public TranscodeWorkingMode TranscodeWorkingMode { get; set; } = TranscodeWorkingMode.LocalThenCopyToStaging;
     public WorkerTranscodingOptions Transcoding { get; set; } = new();
+    public WorkerStagingCopyOptions StagingCopy { get; set; } = new();
     public WorkerLimitsDto Limits { get; set; } = new();
     public List<PathMappingOptions> PathMappings { get; set; } = [];
     public ShutdownOptions Shutdown { get; set; } = new();
@@ -28,6 +29,12 @@ public sealed class WorkerTranscodingOptions
     public bool AllowGpuEncoding { get; set; } = true;
     public List<string> CpuEncoders { get; set; } = ["libx265", "libx264", "libsvtav1", "libaom-av1"];
     public List<string> GpuEncoders { get; set; } = ["hevc_nvenc", "h264_nvenc", "av1_nvenc", "hevc_qsv", "h264_qsv", "av1_qsv", "hevc_vaapi", "h264_vaapi", "av1_vaapi", "hevc_amf", "h264_amf", "av1_amf", "hevc_videotoolbox", "h264_videotoolbox"];
+}
+
+public sealed class WorkerStagingCopyOptions
+{
+    public int MaxConcurrentCopies { get; set; } = 1;
+    public int MaxBufferedLocalOutputs { get; set; } = 4;
 }
 
 public sealed class PathMappingOptions
