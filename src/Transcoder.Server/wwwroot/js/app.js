@@ -1290,9 +1290,26 @@ function renderMediaActions(media) {
     <button class="button" onclick="showMediaPlan(${media.id})">View Plan</button>
     ${media.hasPlan ? queueButton : ''}
     ${replaceButton}
+    <button class="button" onclick="resetReplanMedia(${media.id})" title="Clear stale plan/staging state, cancel queued jobs for this item, and generate a fresh plan">Reset/Replan</button>
   </div>`;
 }
 
+
+
+window.resetReplanMedia = async (mediaId) => {
+  if (!confirm('Reset this media item and generate a fresh plan?\n\nThis clears stale plan/staging state and resolves current review rows for this item. It does not delete files from disk.')) return;
+
+  try {
+    const result = await api(`/api/media/${mediaId}/reset-replan`, { method: 'POST' });
+    alert(result.message || 'Media reset and re-planned.');
+    await refreshMedia();
+    await refreshMediaBrowser();
+    await refreshReview();
+    await refreshJobs();
+  } catch (error) {
+    alert(error.message || error);
+  }
+};
 
 window.replaceMedia = async (mediaId) => {
   if (!confirm('Replace the original with this staged output? The original is moved to quarantine first.')) return;

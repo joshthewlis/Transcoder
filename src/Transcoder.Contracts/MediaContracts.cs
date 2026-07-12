@@ -169,6 +169,19 @@ public sealed class SetMediaMetadataRequest
 }
 
 
+
+public sealed class ResetReplanMediaResultDto
+{
+    public long MediaId { get; set; }
+    public bool Reset { get; set; }
+    public bool ProbeQueued { get; set; }
+    public bool PlanGenerated { get; set; }
+    public MediaStatus? MediaStatus { get; set; }
+    public int CancelledQueuedJobs { get; set; }
+    public int ResolvedReviewItems { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+
 public sealed class MediaBrowserDto
 {
     public int LibraryId { get; set; }

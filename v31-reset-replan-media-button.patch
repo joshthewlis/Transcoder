@@ -1,0 +1,175 @@
+diff --git a/src/Transcoder.Contracts/MediaContracts.cs b/src/Transcoder.Contracts/MediaContracts.cs
+index 0699146..a6a04c4 100644
+--- a/src/Transcoder.Contracts/MediaContracts.cs
++++ b/src/Transcoder.Contracts/MediaContracts.cs
+@@ -127,6 +127,19 @@ public sealed class SetMediaMetadataRequest
+ }
+ 
+ 
++
++public sealed class ResetReplanMediaResultDto
++{
++    public long MediaId { get; set; }
++    public bool Reset { get; set; }
++    public bool ProbeQueued { get; set; }
++    public bool PlanGenerated { get; set; }
++    public MediaStatus? MediaStatus { get; set; }
++    public int CancelledQueuedJobs { get; set; }
++    public int ResolvedReviewItems { get; set; }
++    public string Message { get; set; } = string.Empty;
++}
++
+ public sealed class MediaBrowserDto
+ {
+     public int LibraryId { get; set; }
+diff --git a/src/Transcoder.Server/Controllers/MediaController.cs b/src/Transcoder.Server/Controllers/MediaController.cs
+index ab79029..0f064e3 100644
+--- a/src/Transcoder.Server/Controllers/MediaController.cs
++++ b/src/Transcoder.Server/Controllers/MediaController.cs
+@@ -163,6 +163,114 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
+         return string.IsNullOrWhiteSpace(item.PlanJson) ? NotFound(new { message = "No plan exists for this media item." }) : Content(item.PlanJson, "application/json");
+     }
+ 
++
++    [HttpPost("{mediaId:long}/reset-replan")]
++    public async Task<ActionResult<ResetReplanMediaResultDto>> ResetAndReplan(long mediaId, CancellationToken cancellationToken = default)
++    {
++        var item = await db.MediaItems.Include(x => x.Library).FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
++        if (item is null) return NotFound();
++
++        var result = new ResetReplanMediaResultDto
++        {
++            MediaId = item.Id,
++            Reset = false,
++            MediaStatus = item.Status
++        };
++
++        var activeJobs = await db.Jobs
++            .Where(x => x.MediaItemId == item.Id && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
++            .OrderBy(x => x.Id)
++            .ToListAsync(cancellationToken);
++
++        var runningJobs = activeJobs.Where(x => x.Status is JobStatus.Leased or JobStatus.Running).ToList();
++        if (runningJobs.Count > 0)
++        {
++            result.Message = $"Media has {runningJobs.Count} leased/running job(s). Drain or cancel active work before resetting this item.";
++            return Conflict(result);
++        }
++
++        foreach (var job in activeJobs.Where(x => x.Status == JobStatus.Queued))
++        {
++            job.Status = JobStatus.Cancelled;
++            job.LastMessage = "Cancelled by Reset/Replan.";
++            job.LastError = null;
++            job.LeaseId = null;
++            job.LastLeaseId = null;
++            job.LeasedByWorkerId = null;
++            job.LeasedByWorkerInstanceId = null;
++            job.LeaseStartedUtc = null;
++            job.LeaseLastSeenUtc = null;
++            job.LeaseExpiresUtc = null;
++            result.CancelledQueuedJobs++;
++        }
++
++        var openReviews = await db.ReviewItems
++            .Where(x => x.MediaItemId == item.Id && !x.Resolved)
++            .ToListAsync(cancellationToken);
++
++        foreach (var review in openReviews)
++        {
++            review.Resolved = true;
++            review.ResolvedUtc = DateTime.UtcNow;
++            result.ResolvedReviewItems++;
++        }
++
++        item.PlanJson = null;
++        item.PlanHash = null;
++        item.PlanReviewJson = null;
++        item.PlanCreatedUtc = null;
++        item.PlanReviewedUtc = null;
++        item.StagingPath = null;
++        item.MetadataJson = null;
++        item.MetadataError = null;
++        item.UpdatedUtc = DateTime.UtcNow;
++        item.Status = string.IsNullOrWhiteSpace(item.ProbeJson) ? MediaStatus.New : MediaStatus.Probed;
++
++        await db.SaveChangesAsync(cancellationToken);
++
++        result.Reset = true;
++
++        if (string.IsNullOrWhiteSpace(item.ProbeJson))
++        {
++            db.Jobs.Add(new JobEntity
++            {
++                JobType = JobType.Probe,
++                Status = JobStatus.Queued,
++                LibraryId = item.LibraryId,
++                MediaItemId = item.Id,
++                PayloadJson = JsonSerializer.Serialize(new
++                {
++                    libraryId = item.LibraryId,
++                    mediaId = item.Id,
++                    inputPath = item.FullPath,
++                    fileSizeBytes = item.FileSizeBytes,
++                    lastModifiedUtc = item.LastModifiedUtc
++                }, JsonOptions)
++            });
++            item.Status = MediaStatus.ProbeQueued;
++            item.UpdatedUtc = DateTime.UtcNow;
++            await db.SaveChangesAsync(cancellationToken);
++
++            result.ProbeQueued = true;
++            result.MediaStatus = item.Status;
++            result.Message = "Media reset. Probe was queued because no probe data exists yet.";
++            return Accepted(result);
++        }
++
++        var plan = await planner.BuildAndQueuePlanAsync(mediaId, force: true, cancellationToken);
++        result.PlanGenerated = plan is not null;
++
++        var refreshed = await db.MediaItems.AsNoTracking().FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
++        result.MediaStatus = refreshed?.Status;
++        result.Message = plan is null
++            ? "Media reset. Probe is required before a new plan can be generated."
++            : plan.BlockingReasons.Count > 0
++                ? "Media reset and re-planned. Blocking reasons were recreated in Review."
++                : "Media reset and re-planned.";
++
++        return Ok(result);
++    }
++
+     [HttpPost("{mediaId:long}/cleanup")]
+     public async Task<ActionResult<QueueMediaWorkResultDto>> Cleanup(long mediaId, CancellationToken cancellationToken)
+     {
+diff --git a/src/Transcoder.Server/wwwroot/js/app.js b/src/Transcoder.Server/wwwroot/js/app.js
+index 5211b39..1a1eac1 100644
+--- a/src/Transcoder.Server/wwwroot/js/app.js
++++ b/src/Transcoder.Server/wwwroot/js/app.js
+@@ -1229,10 +1229,27 @@ function renderMediaActions(media) {
+     <button class="button" onclick="showMediaPlan(${media.id})">View Plan</button>
+     ${media.hasPlan ? queueButton : ''}
+     ${replaceButton}
++    <button class="button" onclick="resetReplanMedia(${media.id})" title="Clear stale plan/staging state, cancel queued jobs for this item, and generate a fresh plan">Reset/Replan</button>
+   </div>`;
+ }
+ 
+ 
++
++window.resetReplanMedia = async (mediaId) => {
++  if (!confirm('Reset this media item and generate a fresh plan?\n\nThis clears stale plan/staging state and resolves current review rows for this item. It does not delete files from disk.')) return;
++
++  try {
++    const result = await api(`/api/media/${mediaId}/reset-replan`, { method: 'POST' });
++    alert(result.message || 'Media reset and re-planned.');
++    await refreshMedia();
++    await refreshMediaBrowser();
++    await refreshReview();
++    await refreshJobs();
++  } catch (error) {
++    alert(error.message || error);
++  }
++};
++
+ window.replaceMedia = async (mediaId) => {
+   if (!confirm('Replace the original with this staged output? The original is moved to quarantine first.')) return;
+   try {
