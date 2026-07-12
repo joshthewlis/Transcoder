@@ -89,18 +89,18 @@ public static class MediaProcessingStatsStore
             totals.OriginalSizeBytes += item.FileSizeBytes;
 
             var stats = Read(item);
-            var totalSaved = stats.TotalSavedBytes ?? stats.SavedBytes;
+            var totalSaved = stats.ReplacedOriginal ? stats.TotalSavedBytes ?? stats.SavedBytes : null;
             if (totalSaved is not null)
             {
                 totals.CompletedCount++;
                 totals.ActualSavedBytes += totalSaved.Value;
             }
-            if (stats.CleanupSavedBytes is not null)
+            if (stats.ReplacedOriginal && stats.CleanupSavedBytes is not null)
                 totals.CleanupSavedBytes += stats.CleanupSavedBytes.Value;
-            if (stats.TranscodeSavedBytes is not null)
+            if (stats.ReplacedOriginal && stats.TranscodeSavedBytes is not null)
                 totals.TranscodeSavedBytes += stats.TranscodeSavedBytes.Value;
 
-            if (stats.OutputSizeBytes is not null)
+            if (stats.ReplacedOriginal && stats.OutputSizeBytes is not null)
             {
                 totals.ActualOutputSizeBytes = (totals.ActualOutputSizeBytes ?? 0) + stats.OutputSizeBytes.Value;
             }

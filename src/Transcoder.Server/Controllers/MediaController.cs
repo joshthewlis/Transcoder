@@ -296,6 +296,12 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
     {
         var planSummary = MediaProcessingStatsStore.ReadPlanSummary(item.PlanJson);
         var stats = MediaProcessingStatsStore.Read(item);
+        var actualSaved = stats.ReplacedOriginal ? stats.SavedBytes : null;
+        var actualCleanupSaved = stats.ReplacedOriginal ? stats.CleanupSavedBytes : null;
+        var actualTranscodeSaved = stats.ReplacedOriginal ? stats.TranscodeSavedBytes : null;
+        var actualTotalSaved = stats.ReplacedOriginal ? stats.TotalSavedBytes ?? stats.SavedBytes : null;
+        var actualOutputSize = stats.ReplacedOriginal ? stats.OutputSizeBytes : null;
+
         return new MediaItemDto
         {
             Id = item.Id,
@@ -309,11 +315,11 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
             HasPlan = !string.IsNullOrWhiteSpace(item.PlanJson),
             PlanHash = item.PlanHash,
             StagingPath = item.StagingPath,
-            ActualOutputSizeBytes = stats.OutputSizeBytes,
-            ActualSavedBytes = stats.SavedBytes,
-            ActualCleanupSavedBytes = stats.CleanupSavedBytes,
-            ActualTranscodeSavedBytes = stats.TranscodeSavedBytes,
-            ActualTotalSavedBytes = stats.TotalSavedBytes ?? stats.SavedBytes,
+            ActualOutputSizeBytes = actualOutputSize,
+            ActualSavedBytes = actualSaved,
+            ActualCleanupSavedBytes = actualCleanupSaved,
+            ActualTranscodeSavedBytes = actualTranscodeSaved,
+            ActualTotalSavedBytes = actualTotalSaved,
             LastCompletedWorkType = stats.LastCompletedWorkType,
             LastWorkCompletedUtc = stats.CompletedUtc,
             StagingTransferComplete = stats.StagingTransferComplete,

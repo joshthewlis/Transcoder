@@ -33,11 +33,92 @@ public sealed class SystemController(TranscoderDbContext db, SystemSettingsServi
             AutoQueueTranscodeJobs: execution.AutoQueueTranscodeJobs,
             RequirePlanReviewBeforeAutoQueue: execution.RequirePlanReviewBeforeAutoQueue,
             ActiveHours: activeHours,
-            TotalActualSavedBytes: stats.Where(x => (x.TotalSavedBytes ?? x.SavedBytes) is not null).Sum(x => (x.TotalSavedBytes ?? x.SavedBytes)!.Value),
-            CompletedCleanupCount: stats.Count(x => x.LastCompletedWorkType == JobType.Cleanup),
-            CompletedTranscodeCount: stats.Count(x => x.LastCompletedWorkType == JobType.Transcode));
+            TotalActualSavedBytes: stats.Where(x => x.ReplacedOriginal && (x.TotalSavedBytes ?? x.SavedBytes) is not null).Sum(x => (x.TotalSavedBytes ?? x.SavedBytes)!.Value),
+            CompletedCleanupCount: stats.Count(x => x.ReplacedOriginal && x.LastCompletedWorkType == JobType.Cleanup),
+            CompletedTranscodeCount: stats.Count(x => x.ReplacedOriginal && x.LastCompletedWorkType == JobType.Transcode));
 
         return dto;
+    }
+
+    [HttpPost("stats/recalculate-savings")]
+    public async Task<ActionResult<object>> RecalculateSavings(CancellationToken cancellationToken)
+    {
+        var items = await db.MediaItems
+            .Where(x => x.MetadataJson != null && x.MetadataJson != "")
+            .ToListAsync(cancellationToken);
+
+        long beforeSavedBytes = 0;
+        long afterSavedBytes = 0;
+        var recalculated = 0;
+        var clearedUnreplaced = 0;
+
+        foreach (var item in items)
+        {
+            var stats = MediaProcessingStatsStore.Read(item);
+            var previousSaved = stats.TotalSavedBytes ?? stats.SavedBytes;
+            if (previousSaved is > 0)
+                beforeSavedBytes += previousSaved.Value;
+
+            if (!stats.ReplacedOriginal)
+            {
+                if (stats.TotalSavedBytes is not null || stats.SavedBytes is not null || stats.CleanupSavedBytes is not null || stats.TranscodeSavedBytes is not null)
+                    clearedUnreplaced++;
+
+                stats.TotalSavedBytes = null;
+                stats.SavedBytes = null;
+                stats.CleanupSavedBytes = null;
+                stats.TranscodeSavedBytes = null;
+                MediaProcessingStatsStore.Write(item, stats);
+                continue;
+            }
+
+            var originalSize = stats.OriginalSizeBytes;
+            if (originalSize is null)
+            {
+                originalSize = stats.History
+                    .Where(x => x.BeforeSizeBytes is not null)
+                    .OrderBy(x => x.CompletedUtc)
+                    .Select(x => x.BeforeSizeBytes)
+                    .FirstOrDefault();
+            }
+
+            originalSize ??= item.FileSizeBytes;
+            var outputSize = item.FileSizeBytes;
+            var savedBytes = Math.Max(0, originalSize.Value - outputSize);
+
+            stats.OriginalSizeBytes = originalSize;
+            stats.OutputSizeBytes = outputSize;
+            stats.SavedBytes = savedBytes;
+            stats.TotalSavedBytes = savedBytes;
+
+            if (stats.LastCompletedWorkType == JobType.Transcode)
+            {
+                stats.TranscodeSavedBytes = savedBytes;
+                stats.CleanupSavedBytes = null;
+            }
+            else
+            {
+                stats.CleanupSavedBytes = savedBytes;
+                stats.TranscodeSavedBytes = null;
+            }
+
+            MediaProcessingStatsStore.Write(item, stats);
+            afterSavedBytes += savedBytes;
+            recalculated++;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        return Ok(new
+        {
+            considered = items.Count,
+            recalculated,
+            clearedUnreplaced,
+            beforeSavedBytes,
+            afterSavedBytes,
+            deltaBytes = afterSavedBytes - beforeSavedBytes,
+            message = "Savings totals recalculated from replaced media only. Staged-but-not-replaced outputs are no longer counted as actual saved space."
+        });
     }
 
     [HttpGet("mode")]
