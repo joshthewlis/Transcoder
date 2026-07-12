@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Transcoder.Contracts;
@@ -40,11 +41,35 @@ public sealed class ReviewController(TranscoderDbContext db) : ControllerBase
     {
         var item = await db.ReviewItems.FirstOrDefaultAsync(x => x.Id == reviewId, cancellationToken);
         if (item is null) return NotFound();
+
         item.Resolved = true;
         item.ResolvedUtc = DateTime.UtcNow;
+
         var media = await db.MediaItems.FirstOrDefaultAsync(x => x.Id == item.MediaItemId, cancellationToken);
         if (media is not null && !string.IsNullOrWhiteSpace(media.PlanJson))
-            media.Status = MediaStatus.ReadyToTranscode;
+        {
+            var plan = TryReadPlan(media.PlanJson);
+            media.PlanReviewJson = JsonSerializer.Serialize(new
+            {
+                reviewStatus = "Approved",
+                source = "ManualReview",
+                reviewId = item.Id,
+                reviewType = item.ReviewType.ToString(),
+                approvedUtc = item.ResolvedUtc,
+                planHash = media.PlanHash
+            });
+            media.PlanReviewedUtc = DateTime.UtcNow;
+            media.UpdatedUtc = DateTime.UtcNow;
+
+            media.Status = plan is null
+                ? MediaStatus.ReadyToTranscode
+                : IsNoActionPlan(plan)
+                    ? MediaStatus.Skipped
+                    : IsCleanupPlan(plan)
+                        ? MediaStatus.ReadyToCleanup
+                        : MediaStatus.ReadyToTranscode;
+        }
+
         await db.SaveChangesAsync(cancellationToken);
         return NoContent();
     }
@@ -64,6 +89,22 @@ public sealed class ReviewController(TranscoderDbContext db) : ControllerBase
 
     [HttpPost("{reviewId:long}/stream-actions")]
     public IActionResult StreamActions(long reviewId) => Accepted(new { reviewId, message = "Manual stream action support is reserved for the planner implementation pass." });
+
+    private static TranscodePlanDto? TryReadPlan(string planJson)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<TranscodePlanDto>(planJson, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsCleanupPlan(TranscodePlanDto plan) => plan.PlanKind.Equals("CleanupOnly", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNoActionPlan(TranscodePlanDto plan) => plan.PlanKind.Equals("NoAction", StringComparison.OrdinalIgnoreCase);
 
     private static ReviewItemDto ToDto(ReviewItemEntity item, MediaItemEntity? media) => new()
     {

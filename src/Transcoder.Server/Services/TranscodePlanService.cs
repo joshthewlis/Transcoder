@@ -191,7 +191,7 @@ public sealed class TranscodePlanService(
                 continue;
             }
 
-            if (plan is null || IsNoActionPlan(plan) || plan.BlockingReasons.Count > 0)
+            if (plan is null || IsNoActionPlan(plan) || (plan.BlockingReasons.Count > 0 && !HasApprovedPlanReview(media)))
             {
                 result.Skipped++;
                 continue;
@@ -526,7 +526,8 @@ public sealed class TranscodePlanService(
             };
         }
 
-        if (plan.BlockingReasons.Count > 0)
+        var planReviewApproved = HasApprovedPlanReview(media);
+        if (plan.BlockingReasons.Count > 0 && !planReviewApproved)
         {
             return new QueueMediaWorkResultDto
             {
@@ -534,7 +535,7 @@ public sealed class TranscodePlanService(
                 Accepted = false,
                 Queued = false,
                 MediaStatus = media.Status,
-                Message = "The plan has blocking reasons. Fix or review the plan before queueing work."
+                Message = "The plan has blocking reasons. Approve the review item before queueing work."
             };
         }
 
@@ -579,7 +580,7 @@ public sealed class TranscodePlanService(
         }
 
         var policy = DeserializePolicy(media.Library.PolicyJson);
-        if (policy.Review.PlanReviewRequired && !HasApprovedPlanReview(media))
+        if (policy.Review.PlanReviewRequired && !planReviewApproved)
         {
             return new QueueMediaWorkResultDto
             {
@@ -716,7 +717,7 @@ public sealed class TranscodePlanService(
 
     private async Task QueueWorkIfAutoAllowedAsync(MediaItemEntity media, TranscodePlanDto? plan, CancellationToken cancellationToken)
     {
-        if (plan is null || IsNoActionPlan(plan) || plan.BlockingReasons.Count > 0)
+        if (plan is null || IsNoActionPlan(plan) || (plan.BlockingReasons.Count > 0 && !HasApprovedPlanReview(media)))
             return;
 
         var policy = media.Library is null ? null : DeserializePolicy(media.Library.PolicyJson);
