@@ -113,6 +113,7 @@ services:
       Transcoder__WorkerId: probe-worker-3
       Transcoder__WorkerName: Probe Worker 3
       Transcoder__Roles: Prober, Transcoder, Validator
+
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
