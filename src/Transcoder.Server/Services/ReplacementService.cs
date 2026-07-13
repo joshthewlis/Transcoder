@@ -58,8 +58,17 @@ public sealed class ReplacementService(
         if (Math.Abs((originalInfo.LastWriteTimeUtc - media.LastModifiedUtc).TotalSeconds) > 5)
             return Reject(media.Id, "Original modified time changed since planning. Re-scan/re-probe before replacing.", media.Status);
 
-        var backupPath = BuildBackupPath(media.Library, media);
+        var keepOriginalsQuarantine = storageOptions.Value.KeepOriginalsQuarantine;
+        var backupPath = keepOriginalsQuarantine
+            ? BuildBackupPath(media.Library, media)
+            : BuildTemporaryRollbackPath(media);
         Directory.CreateDirectory(Path.GetDirectoryName(backupPath)!);
+
+        logger.LogInformation(
+            "Replacing media {MediaId}; keep originals quarantine: {KeepOriginalsQuarantine}; backup path: {BackupPath}",
+            media.Id,
+            keepOriginalsQuarantine,
+            backupPath);
 
         var originalPath = media.FullPath;
         var wasCleanup = media.Status == MediaStatus.StagedCleaned;
@@ -79,6 +88,10 @@ public sealed class ReplacementService(
             }
 
             TryDelete(markerPath);
+
+            if (!keepOriginalsQuarantine)
+                TryDelete(backupPath);
+
             TryDeleteEmptyDirectories(Path.GetDirectoryName(stagingPath), storageOptions.Value.StagingRoot);
 
             var replacementInfo = new FileInfo(originalPath);
@@ -87,7 +100,7 @@ public sealed class ReplacementService(
             stats.OutputSizeBytes = replacementInfo.Length;
             stats.TotalSavedBytes = latestSaved;
             stats.ReplacedOriginal = true;
-            stats.ReplacementBackupPath = backupPath;
+            stats.ReplacementBackupPath = keepOriginalsQuarantine ? backupPath : null;
             stats.ReplacedUtc = DateTime.UtcNow;
             MediaProcessingStatsStore.AddHistory(stats, new ProcessingHistoryEntry
             {
@@ -100,8 +113,10 @@ public sealed class ReplacementService(
                 TotalSavedBytes = latestSaved,
                 InputPath = stagingPath,
                 OutputPath = originalPath,
-                BackupPath = backupPath,
-                Message = "Staged output replaced original; original moved to quarantine."
+                BackupPath = keepOriginalsQuarantine ? backupPath : null,
+                Message = keepOriginalsQuarantine
+                    ? "Staged output replaced original; original moved to quarantine."
+                    : "Staged output replaced original; temporary rollback copy deleted."
             });
             MediaProcessingStatsStore.Write(media, stats);
 
@@ -123,11 +138,13 @@ public sealed class ReplacementService(
                 MediaId = media.Id,
                 Accepted = true,
                 Replaced = true,
-                Message = "Original replaced successfully. The old file is in quarantine and the media item needs a fresh probe before further work.",
+                Message = keepOriginalsQuarantine
+                    ? "Original replaced successfully. The old file is in quarantine and the media item needs a fresh probe before further work."
+                    : "Original replaced successfully. The temporary rollback copy was deleted and the media item needs a fresh probe before further work.",
                 MediaStatus = media.Status,
                 OriginalPath = originalPath,
                 StagingPath = stagingPath,
-                BackupPath = backupPath,
+                BackupPath = keepOriginalsQuarantine ? backupPath : null,
                 OriginalSizeBytes = firstOriginalSize,
                 ReplacementSizeBytes = replacementInfo.Length,
                 TotalSavedBytes = latestSaved
@@ -183,6 +200,14 @@ public sealed class ReplacementService(
         var extension = Path.GetExtension(relative);
         var stamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
         return Path.Combine(storageOptions.Value.TranscoderRoot, "originals", libraryName, directory, $"{name}.original-{stamp}{extension}");
+    }
+
+    private static string BuildTemporaryRollbackPath(MediaItemEntity media)
+    {
+        var directory = Path.GetDirectoryName(media.FullPath) ?? string.Empty;
+        var name = Path.GetFileName(media.FullPath);
+        var stamp = DateTime.UtcNow.ToString("yyyyMMddTHHmmssZ");
+        return Path.Combine(directory, $".{name}.transcoder-rollback-{stamp}.tmp");
     }
 
     private static void MoveFile(string source, string destination, bool overwrite)

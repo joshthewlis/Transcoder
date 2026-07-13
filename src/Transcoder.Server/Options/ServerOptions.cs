@@ -26,6 +26,10 @@ public sealed class StorageOptions
     public string WorkingRoot { get; set; } = "/mnt/.transcoder/working";
     public string StagingRoot { get; set; } = "/mnt/.transcoder/staging";
     public bool AutoCreateStorageFolders { get; set; } = true;
+
+    // When false, originals are only moved to a temporary rollback file during replace
+    // and are deleted immediately after the staged file has been installed.
+    public bool KeepOriginalsQuarantine { get; set; } = true;
 }
 
 
