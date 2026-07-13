@@ -30,6 +30,7 @@ public sealed class WorkerLoopService(
     private int _pollSeconds = 10;
     private DateTime? _idleSinceUtc;
     private readonly ConcurrentDictionary<long, ActiveJobState> _activeJobs = new();
+    private readonly SemaphoreSlim _sourceCopySlots = new(Math.Max(1, options.Value.SourceCopy.MaxConcurrentCopies), Math.Max(1, options.Value.SourceCopy.MaxConcurrentCopies));
     private readonly SemaphoreSlim _stagingCopySlots = new(Math.Max(1, options.Value.StagingCopy.MaxConcurrentCopies), Math.Max(1, options.Value.StagingCopy.MaxConcurrentCopies));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -373,17 +374,50 @@ public sealed class WorkerLoopService(
     private WorkerCapacityDto BuildAvailableCapacity()
     {
         var stagingBacklogFull = IsStagingCopyBacklogFull();
+        var localPipelineRemaining = GetLocalPipelineRemainingSlots();
+
+        var cleanupCapacity = stagingBacklogFull
+            ? 0
+            : Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup));
+        var transcodeCapacity = stagingBacklogFull
+            ? 0
+            : Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode));
+
+        if (_options.SourceCopy.Enabled && localPipelineRemaining >= 0)
+        {
+            var cleanupLeaseSlots = Math.Min(cleanupCapacity, localPipelineRemaining);
+            localPipelineRemaining -= cleanupLeaseSlots;
+
+            cleanupCapacity = cleanupLeaseSlots;
+            transcodeCapacity = Math.Min(transcodeCapacity, Math.Max(0, localPipelineRemaining));
+        }
+
         return new WorkerCapacityDto
         {
             Probe = Math.Max(0, _options.Limits.MaxProbeJobs - CountActive(JobType.Probe)),
             PlanReview = Math.Max(0, _options.Limits.MaxPlanReviewJobs - CountActive(JobType.PlanReview)),
-            Cleanup = stagingBacklogFull ? 0 : Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup)),
-            Transcode = stagingBacklogFull ? 0 : Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode)),
+            Cleanup = cleanupCapacity,
+            Transcode = transcodeCapacity,
             Validation = Math.Max(0, _options.Limits.MaxValidationJobs - CountActive(JobType.ValidateOutput))
         };
     }
 
     private int CountActive(JobType jobType) => _activeJobs.Values.Count(x => x.JobType == jobType);
+
+    private int CountTranscodePipelineBacklog()
+        => _activeJobs.Values.Count(x => x.JobType is JobType.Cleanup or JobType.Transcode);
+
+    private int GetLocalPipelineRemainingSlots()
+    {
+        if (!_options.SourceCopy.Enabled)
+            return -1;
+
+        var maxBuffered = _options.SourceCopy.MaxBufferedLocalWorkItems;
+        if (maxBuffered <= 0)
+            return -1;
+
+        return Math.Max(0, maxBuffered - CountTranscodePipelineBacklog());
+    }
 
     private int CountStagingCopyBacklog()
         => _activeJobs.Values.Count(x => x.WaitingForStagingCopy || x.CopyingToStaging);
@@ -597,21 +631,41 @@ public sealed class WorkerLoopService(
         var localOutputPath = Path.Combine(jobWorkRoot, "output" + extension);
         var logPath = Path.Combine(jobWorkRoot, "ffmpeg.log");
 
-        var inputDurationSeconds = await GetInputDurationSecondsAsync(lease.Payload, localInputPath, cancellationToken);
+        var originalInputFileSizeBytes = new FileInfo(localInputPath).Length;
+        string? localSourceCopyPath = null;
+        var ffmpegInputPath = localInputPath;
 
-        UpdateActiveJob(lease.JobId, 1, lease.JobType == JobType.Cleanup ? "Remuxing cleanup to local scratch" : "Encoding to local scratch");
-        var runResult = await ffmpeg.RunAsync(
-            ffmpegArgs,
-            localInputPath,
-            localOutputPath,
-            (progress, message) => UpdateActiveJob(lease.JobId, progress, message),
-            cancellationToken,
-            inputDurationSeconds);
+        try
+        {
+            if (_options.SourceCopy.Enabled)
+            {
+                localSourceCopyPath = await CopySourceToLocalAsync(lease, localInputPath, jobWorkRoot, cancellationToken);
+                ffmpegInputPath = localSourceCopyPath;
+            }
 
-        await File.WriteAllTextAsync(logPath, runResult.LogText, cancellationToken);
+            var inputDurationSeconds = await GetInputDurationSecondsAsync(lease.Payload, ffmpegInputPath, cancellationToken);
 
-        UpdateActiveJob(lease.JobId, 96, "Validating local output");
-        await ffprobe.ProbeAsync(localOutputPath, cancellationToken);
+            UpdateActiveJob(lease.JobId, 1, lease.JobType == JobType.Cleanup ? "Remuxing cleanup from local scratch" : "Encoding from local scratch");
+            MarkSourceProcessingState(lease.JobId, processing: true);
+            var runResult = await ffmpeg.RunAsync(
+                ffmpegArgs,
+                ffmpegInputPath,
+                localOutputPath,
+                (progress, message) => UpdateActiveJob(lease.JobId, progress, message),
+                cancellationToken,
+                inputDurationSeconds);
+            MarkSourceProcessingState(lease.JobId, processing: false);
+
+            await File.WriteAllTextAsync(logPath, runResult.LogText, cancellationToken);
+
+            UpdateActiveJob(lease.JobId, 96, "Validating local output");
+            await ffprobe.ProbeAsync(localOutputPath, cancellationToken);
+
+            if (_options.SourceCopy.Enabled && _options.SourceCopy.DeleteLocalSourceAfterFfmpeg && localSourceCopyPath is not null)
+            {
+                TryDeleteFile(localSourceCopyPath);
+                localSourceCopyPath = null;
+            }
 
         var stagingDirectory = Path.GetDirectoryName(localStagingOutputPath);
         if (!string.IsNullOrWhiteSpace(stagingDirectory))
@@ -631,44 +685,85 @@ public sealed class WorkerLoopService(
             localStagingCompleteMarkerPath,
             cancellationToken);
 
-        var outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length;
-        var inputFileSizeBytes = new FileInfo(localInputPath).Length;
-        var result = JsonSerializer.SerializeToElement(new
-        {
-            inputPath,
-            stagingOutputPath,
-            localOutputPath = _options.KeepLocalJobFilesOnSuccess ? localOutputPath : null,
-            logPath = _options.KeepLocalJobFilesOnSuccess ? logPath : null,
-            stagingCompleteMarkerPath,
-            localStagingCompleteMarkerPath,
-            stagingTransferComplete = true,
-            exitCode = runResult.ExitCode,
-            elapsedSeconds = runResult.Elapsed.TotalSeconds,
-            outputFileSizeBytes,
-            savedBytes = inputFileSizeBytes - outputFileSizeBytes,
-            completedUtc = DateTime.UtcNow,
-            jobType = lease.JobType.ToString(),
-            operation = operationName,
-            inputFileSizeBytes
-        }, _jsonOptions);
+            var outputFileSizeBytes = new FileInfo(localStagingOutputPath).Length;
+            var inputFileSizeBytes = originalInputFileSizeBytes;
+            var result = JsonSerializer.SerializeToElement(new
+            {
+                inputPath,
+                stagingOutputPath,
+                copiedSourceToLocal = _options.SourceCopy.Enabled,
+                localOutputPath = _options.KeepLocalJobFilesOnSuccess ? localOutputPath : null,
+                logPath = _options.KeepLocalJobFilesOnSuccess ? logPath : null,
+                stagingCompleteMarkerPath,
+                localStagingCompleteMarkerPath,
+                stagingTransferComplete = true,
+                exitCode = runResult.ExitCode,
+                elapsedSeconds = runResult.Elapsed.TotalSeconds,
+                outputFileSizeBytes,
+                savedBytes = inputFileSizeBytes - outputFileSizeBytes,
+                completedUtc = DateTime.UtcNow,
+                jobType = lease.JobType.ToString(),
+                operation = operationName,
+                inputFileSizeBytes
+            }, _jsonOptions);
 
-        if (!_options.KeepLocalJobFilesOnSuccess)
-        {
-            TryDeleteDirectory(jobWorkRoot);
-            TryDeleteEmptyParentDirectories(jobWorkRoot, _options.LocalWorkingRoot);
+            if (!_options.KeepLocalJobFilesOnSuccess)
+            {
+                TryDeleteDirectory(jobWorkRoot);
+                TryDeleteEmptyParentDirectories(jobWorkRoot, _options.LocalWorkingRoot);
+            }
+
+            logger.LogInformation("{Operation} complete for {Path}. Output size {OutputSizeBytes} bytes, saved {SavedBytes} bytes.", operationName, inputPath, outputFileSizeBytes, inputFileSizeBytes - outputFileSizeBytes);
+            UpdateActiveJob(lease.JobId, 100, lease.JobType == JobType.Cleanup ? "Cleanup staged" : "Transcode staged");
+            await api.CompleteJobAsync(lease.JobId, new JobCompleteRequest
+            {
+                WorkerId = _options.WorkerId,
+                WorkerInstanceId = _instanceId,
+                LeaseId = lease.LeaseId,
+                Result = result
+            }, cancellationToken);
         }
-
-        logger.LogInformation("{Operation} complete for {Path}. Output size {OutputSizeBytes} bytes, saved {SavedBytes} bytes.", operationName, inputPath, outputFileSizeBytes, inputFileSizeBytes - outputFileSizeBytes);
-        UpdateActiveJob(lease.JobId, 100, lease.JobType == JobType.Cleanup ? "Cleanup staged" : "Transcode staged");
-        await api.CompleteJobAsync(lease.JobId, new JobCompleteRequest
+        finally
         {
-            WorkerId = _options.WorkerId,
-            WorkerInstanceId = _instanceId,
-            LeaseId = lease.LeaseId,
-            Result = result
-        }, cancellationToken);
+            MarkSourceProcessingState(lease.JobId, processing: false);
+            if (localSourceCopyPath is not null && _options.SourceCopy.DeleteLocalSourceAfterFfmpeg)
+                TryDeleteFile(localSourceCopyPath);
+        }
     }
 
+
+    private async Task<string> CopySourceToLocalAsync(
+        JobLeaseDto lease,
+        string localInputPath,
+        string jobWorkRoot,
+        CancellationToken cancellationToken)
+    {
+        var extension = Path.GetExtension(localInputPath);
+        if (string.IsNullOrWhiteSpace(extension)) extension = ".input";
+        var localSourcePath = Path.Combine(jobWorkRoot, "source" + extension);
+
+        MarkSourceCopyState(lease.JobId, waiting: true, copying: false);
+        UpdateActiveJob(lease.JobId, 1, $"Waiting for source copy slot ({CountTranscodePipelineBacklog()}/{Math.Max(1, _options.SourceCopy.MaxBufferedLocalWorkItems)} local work items)");
+
+        await _sourceCopySlots.WaitAsync(cancellationToken);
+        try
+        {
+            MarkSourceCopyState(lease.JobId, waiting: false, copying: true);
+            UpdateActiveJob(lease.JobId, 2, "Copying source to local scratch");
+
+            if (File.Exists(localSourcePath))
+                File.Delete(localSourcePath);
+
+            await CopyFileAsync(localInputPath, localSourcePath, cancellationToken);
+            UpdateActiveJob(lease.JobId, 4, "Source copied to local scratch");
+            return localSourcePath;
+        }
+        finally
+        {
+            MarkSourceCopyState(lease.JobId, waiting: false, copying: false);
+            _sourceCopySlots.Release();
+        }
+    }
 
     private async Task CopyLocalOutputToStagingAsync(
         JobLeaseDto lease,
@@ -726,12 +821,40 @@ public sealed class WorkerLoopService(
         await source.CopyToAsync(destination, bufferSize, cancellationToken);
     }
 
+    private void MarkSourceCopyState(long jobId, bool waiting, bool copying)
+    {
+        if (_activeJobs.TryGetValue(jobId, out var active))
+        {
+            active.WaitingForSourceCopy = waiting;
+            active.CopyingSourceToLocal = copying;
+        }
+    }
+
+    private void MarkSourceProcessingState(long jobId, bool processing)
+    {
+        if (_activeJobs.TryGetValue(jobId, out var active))
+            active.ProcessingLocalSource = processing;
+    }
+
     private void MarkStagingCopyState(long jobId, bool waiting, bool copying)
     {
         if (_activeJobs.TryGetValue(jobId, out var active))
         {
             active.WaitingForStagingCopy = waiting;
             active.CopyingToStaging = copying;
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // Best effort cleanup. Job failure/success should not be masked by scratch cleanup.
         }
     }
 
@@ -911,6 +1034,9 @@ public sealed class WorkerLoopService(
         public string? Message { get; set; }
         public double? Fps { get; set; }
         public int? EtaSeconds { get; set; }
+        public bool WaitingForSourceCopy { get; set; }
+        public bool CopyingSourceToLocal { get; set; }
+        public bool ProcessingLocalSource { get; set; }
         public bool WaitingForStagingCopy { get; set; }
         public bool CopyingToStaging { get; set; }
     }
