@@ -35,6 +35,7 @@ builder.Services.AddScoped<ReplacementService>();
 builder.Services.AddScoped<TranscodePlanService>();
 builder.Services.AddSingleton<IntegrationApiClient>();
 builder.Services.AddScoped<MetadataRefreshService>();
+builder.Services.AddScoped<StorageMapImportService>();
 builder.Services.AddScoped<LibraryScanner>();
 builder.Services.AddScoped<StorageInitializer>();
 builder.Services.AddHostedService<LibraryScanBackgroundService>();

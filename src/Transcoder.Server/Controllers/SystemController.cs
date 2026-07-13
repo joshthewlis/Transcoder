@@ -8,7 +8,7 @@ namespace Transcoder.Server.Controllers;
 
 [ApiController]
 [Route("api/system")]
-public sealed class SystemController(TranscoderDbContext db, SystemSettingsService settings, TranscodePlanService planner) : ControllerBase
+public sealed class SystemController(TranscoderDbContext db, SystemSettingsService settings, TranscodePlanService planner, StorageMapImportService storageMap) : ControllerBase
 {
     [HttpGet("status")]
     public async Task<ActionResult<SystemStatusDto>> GetStatus(CancellationToken cancellationToken)
@@ -120,6 +120,24 @@ public sealed class SystemController(TranscoderDbContext db, SystemSettingsServi
             message = "Savings totals recalculated from replaced media only. Staged-but-not-replaced outputs are no longer counted as actual saved space."
         });
     }
+
+
+    [HttpPost("storage-map/import")]
+    public async Task<ActionResult<StorageMapImportResult>> ImportStorageMap([FromQuery] string? path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await storageMap.ImportAsync(path, cancellationToken);
+        }
+        catch (FileNotFoundException ex)
+        {
+            return NotFound(new { message = ex.Message, path = ex.FileName });
+        }
+    }
+
+    [HttpGet("storage-map/status")]
+    public async Task<ActionResult<StorageMapStatus>> GetStorageMapStatus(CancellationToken cancellationToken) =>
+        await storageMap.GetStatusAsync(cancellationToken);
 
     [HttpGet("mode")]
     public async Task<ActionResult<SetProcessingModeRequest>> GetMode(CancellationToken cancellationToken) =>

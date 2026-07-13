@@ -132,6 +132,10 @@ public sealed class ReplacementService(
             media.Status = wasCleanup ? MediaStatus.ReplacedCleaned : MediaStatus.ReplacedTranscoded;
             media.UpdatedUtc = DateTime.UtcNow;
 
+            // Replacement may create the new file on a different Unraid disk depending on share allocation settings.
+            // Mark the imported physical-disk mapping stale so the next storage-map import refreshes it.
+            await StorageMapImportService.MarkMediaStorageStaleAsync(db, media.Id, cancellationToken);
+
             await db.SaveChangesAsync(cancellationToken);
             return new ReplaceMediaResultDto
             {
