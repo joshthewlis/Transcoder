@@ -1,7 +1,9 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Transcoder.Contracts;
 using Transcoder.Server.Data;
+using Transcoder.Server.Data.Entities;
 using Transcoder.Server.Options;
 
 namespace Transcoder.Server.Services;
@@ -170,6 +172,13 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         job.LeaseLastSeenUtc = DateTime.UtcNow;
         job.LeaseExpiresUtc = DateTime.UtcNow.AddSeconds(timingOptions.Value.MaxLeaseSeconds);
 
+        if (IsInvalidStreamMapFailure(job, request))
+        {
+            await HandleInvalidStreamMapFailureAsync(job, request, cancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
+            return true;
+        }
+
         if (job.AttemptNumber < job.MaxAttempts)
         {
             job.Status = JobStatus.Queued;
@@ -189,6 +198,157 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
 
         await db.SaveChangesAsync(cancellationToken);
         return true;
+    }
+
+    private async Task HandleInvalidStreamMapFailureAsync(JobEntity job, JobFailRequest request, CancellationToken cancellationToken)
+    {
+        if (job.MediaItemId is null)
+        {
+            MarkJobFailed(job);
+            return;
+        }
+
+        var mediaId = job.MediaItemId.Value;
+        var media = await db.MediaItems.FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
+        if (media is null)
+        {
+            MarkJobFailed(job);
+            return;
+        }
+
+        var alreadyRecovered = await db.Jobs.AnyAsync(x =>
+            x.Id != job.Id &&
+            x.MediaItemId == mediaId &&
+            (x.JobType == JobType.Cleanup || x.JobType == JobType.Transcode) &&
+            (EF.Functions.Like(x.LastError ?? string.Empty, "%InvalidStreamMap%") ||
+             EF.Functions.Like(x.LastMessage ?? string.Empty, "%Stream map%matches no streams%")),
+            cancellationToken);
+
+        if (alreadyRecovered)
+        {
+            MarkJobFailed(job);
+            media.Status = MediaStatus.NeedsReview;
+            media.UpdatedUtc = DateTime.UtcNow;
+
+            db.ReviewItems.Add(new Transcoder.Server.Data.Entities.ReviewItemEntity
+            {
+                MediaItemId = media.Id,
+                ReviewType = ReviewType.PlanReviewFailed,
+                Severity = ReviewSeverity.Blocking,
+                Reason = "Cleanup/transcode plan still produced an invalid ffmpeg stream map after reprobe.",
+                DetailsJson = JsonSerializer.Serialize(new
+                {
+                    jobId = job.Id,
+                    jobType = job.JobType.ToString(),
+                    errorCode = request.ErrorCode,
+                    request.Message,
+                    request.Details
+                })
+            });
+
+            return;
+        }
+
+        job.Status = JobStatus.Cancelled;
+        job.CompletedUtc = DateTime.UtcNow;
+        job.Progress = null;
+        job.LastMessage = "Cancelled stale cleanup/transcode plan because ffmpeg reported an invalid stream map. Fresh probe queued.";
+        ClearLease(job);
+
+        var staleJobs = await db.Jobs
+            .Where(x =>
+                x.Id != job.Id &&
+                x.MediaItemId == mediaId &&
+                x.Status != JobStatus.Completed &&
+                x.Status != JobStatus.Cancelled &&
+                x.Status != JobStatus.Failed &&
+                (x.JobType == JobType.Cleanup ||
+                 x.JobType == JobType.Transcode ||
+                 x.JobType == JobType.PlanReview))
+            .ToListAsync(cancellationToken);
+
+        foreach (var staleJob in staleJobs)
+        {
+            staleJob.Status = JobStatus.Cancelled;
+            staleJob.CompletedUtc = DateTime.UtcNow;
+            staleJob.Progress = null;
+            staleJob.LastMessage = "Cancelled because a fresh probe/replan was queued after an invalid ffmpeg stream map.";
+            ClearLease(staleJob);
+        }
+
+        media.ProbeJson = null;
+        media.PlanJson = null;
+        media.PlanHash = null;
+        media.PlanReviewJson = null;
+        media.PlanCreatedUtc = null;
+        media.PlanReviewedUtc = null;
+        media.StagingPath = null;
+        media.Status = MediaStatus.ProbeQueued;
+        media.UpdatedUtc = DateTime.UtcNow;
+
+        var probeAlreadyQueued = await db.Jobs.AnyAsync(x =>
+            x.MediaItemId == media.Id &&
+            x.JobType == JobType.Probe &&
+            (x.Status == JobStatus.Queued ||
+             x.Status == JobStatus.Leased ||
+             x.Status == JobStatus.Running),
+            cancellationToken);
+
+        if (!probeAlreadyQueued)
+        {
+            db.Jobs.Add(new Transcoder.Server.Data.Entities.JobEntity
+            {
+                JobType = JobType.Probe,
+                Status = JobStatus.Queued,
+                LibraryId = media.LibraryId,
+                MediaItemId = media.Id,
+                PayloadJson = JsonSerializer.Serialize(new
+                {
+                    libraryId = media.LibraryId,
+                    mediaId = media.Id,
+                    inputPath = media.FullPath,
+                    fileSizeBytes = media.FileSizeBytes,
+                    lastModifiedUtc = media.LastModifiedUtc
+                }),
+                CreatedUtc = DateTime.UtcNow,
+                QueuedUtc = DateTime.UtcNow,
+                LastMessage = "Queued fresh probe after invalid ffmpeg stream map."
+            });
+        }
+    }
+
+    private static bool IsInvalidStreamMapFailure(JobEntity job, JobFailRequest request)
+    {
+        if (job.JobType is not (JobType.Cleanup or JobType.Transcode))
+            return false;
+
+        if (job.MediaItemId is null)
+            return false;
+
+        if (string.Equals(request.ErrorCode, "InvalidStreamMap", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var combined = $"{request.ErrorCode}\n{request.Message}\n{request.Details}";
+        return combined.Contains("Stream map", StringComparison.OrdinalIgnoreCase) &&
+               combined.Contains("matches no streams", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void MarkJobFailed(JobEntity job)
+    {
+        job.Status = JobStatus.Failed;
+        job.CompletedUtc = DateTime.UtcNow;
+        job.Progress = null;
+        ClearLease(job);
+    }
+
+    private static void ClearLease(JobEntity job)
+    {
+        job.LeaseId = null;
+        job.LeasedByWorkerId = null;
+        job.LeasedByWorkerInstanceId = null;
+        job.LeaseStartedUtc = null;
+        job.LeaseLastSeenUtc = null;
+        job.LeaseExpiresUtc = null;
     }
 
     private static string? TryGetString(System.Text.Json.JsonElement element, string propertyName)

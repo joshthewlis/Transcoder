@@ -405,7 +405,10 @@ public sealed class WorkerLoopService(
     private int CountActive(JobType jobType) => _activeJobs.Values.Count(x => x.JobType == jobType);
 
     private int CountTranscodePipelineBacklog()
-        => _activeJobs.Values.Count(x => x.JobType is JobType.Cleanup or JobType.Transcode);
+        => _activeJobs.Values.Count(x =>
+            (x.JobType is JobType.Cleanup or JobType.Transcode) &&
+            !x.WaitingForStagingCopy &&
+            !x.CopyingToStaging);
 
     private int GetLocalPipelineRemainingSlots()
     {
@@ -487,7 +490,7 @@ public sealed class WorkerLoopService(
                 WorkerId = _options.WorkerId,
                 WorkerInstanceId = _instanceId,
                 LeaseId = lease.LeaseId,
-                ErrorCode = ex.GetType().Name,
+                ErrorCode = GetFailureCode(ex),
                 Message = ex.Message,
                 Details = ex.ToString()
             }, cancellationToken);
@@ -496,6 +499,14 @@ public sealed class WorkerLoopService(
         {
             logger.LogError(reportEx, "Could not report failure for job {JobId}; worker will continue.", lease.JobId);
         }
+    }
+
+    private static string GetFailureCode(Exception ex)
+    {
+        if (ex is FfmpegException ffmpegException && !string.IsNullOrWhiteSpace(ffmpegException.ErrorCode))
+            return ffmpegException.ErrorCode;
+
+        return ex.GetType().Name;
     }
 
     private async Task RunProbeJobAsync(JobLeaseDto lease, CancellationToken cancellationToken)

@@ -80,11 +80,22 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         {
             var failureLog = Tail(logText, MaxFailureLogCharacters);
             logger.LogWarning("ffmpeg failed with exit code {ExitCode}: {Log}", process.ExitCode, failureLog);
-            throw new InvalidOperationException($"ffmpeg failed with exit code {process.ExitCode}: {failureLog}");
+
+            var errorCode = IsInvalidStreamMapFailure(failureLog)
+                ? FfmpegErrorCodes.InvalidStreamMap
+                : FfmpegErrorCodes.FfmpegFailed;
+
+            throw new FfmpegException(errorCode, process.ExitCode, failureLog);
         }
 
         progress?.Invoke(95, "ffmpeg complete");
         return new FfmpegRunResult(process.ExitCode, elapsed, logText);
+    }
+
+    private static bool IsInvalidStreamMapFailure(string logText)
+    {
+        return logText.Contains("Stream map", StringComparison.OrdinalIgnoreCase) &&
+               logText.Contains("matches no streams", StringComparison.OrdinalIgnoreCase);
     }
 
     private static FfmpegProgressUpdate? BuildProgressUpdate(string line, double? inputDurationSeconds, TimeSpan elapsed)
@@ -201,6 +212,27 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
 
         public override string ToString() => _builder.ToString();
     }
+}
+
+public static class FfmpegErrorCodes
+{
+    public const string FfmpegFailed = "FfmpegFailed";
+    public const string InvalidStreamMap = "InvalidStreamMap";
+}
+
+public sealed class FfmpegException : InvalidOperationException
+{
+    public FfmpegException(string errorCode, int exitCode, string ffmpegLog)
+        : base($"ffmpeg failed with exit code {exitCode}: {ffmpegLog}")
+    {
+        ErrorCode = string.IsNullOrWhiteSpace(errorCode) ? FfmpegErrorCodes.FfmpegFailed : errorCode;
+        ExitCode = exitCode;
+        FfmpegLog = ffmpegLog;
+    }
+
+    public string ErrorCode { get; }
+    public int ExitCode { get; }
+    public string FfmpegLog { get; }
 }
 
 public sealed record FfmpegRunResult(int ExitCode, TimeSpan Elapsed, string LogText);
