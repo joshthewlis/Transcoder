@@ -43,8 +43,15 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+
+      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__MaxConcurrentCopies: 1
+      Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
+      Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
+
       Transcoder__StagingCopy__MaxConcurrentCopies: 1
       Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
+      
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
@@ -73,8 +80,15 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+
+      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__MaxConcurrentCopies: 1
+      Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
+      Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
+
       Transcoder__StagingCopy__MaxConcurrentCopies: 1
       Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
+      
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
@@ -103,8 +117,15 @@ services:
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
+
+      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__MaxConcurrentCopies: 1
+      Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
+      Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
+
       Transcoder__StagingCopy__MaxConcurrentCopies: 1
       Transcoder__StagingCopy__MaxBufferedLocalOutputs: 4
+      
       Transcoder__LocalWorkingRoot: /work/transcoder
       Transcoder__AutoCreateLocalWorkingRoot: "true"
       Transcoder__TranscodeWorkingMode: LocalThenCopyToStaging
