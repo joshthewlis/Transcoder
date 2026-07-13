@@ -83,23 +83,10 @@ public static class MediaProcessingStatsStore
     {
         var totals = new MediaBrowserTotalsDto();
         var outputKnown = true;
-        var languageCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
         foreach (var item in items)
         {
             totals.ItemCount++;
             totals.OriginalSizeBytes += item.FileSizeBytes;
-
-            var language = LanguageNormalizer.Normalize(item.OriginalLanguage);
-            if (string.IsNullOrWhiteSpace(language))
-            {
-                totals.OriginalLanguageUnknownCount++;
-            }
-            else
-            {
-                totals.OriginalLanguageKnownCount++;
-                languageCounts[language] = languageCounts.TryGetValue(language, out var count) ? count + 1 : 1;
-            }
 
             var stats = Read(item);
             var totalSaved = stats.ReplacedOriginal ? stats.TotalSavedBytes ?? stats.SavedBytes : null;
@@ -108,10 +95,8 @@ public static class MediaProcessingStatsStore
                 totals.CompletedCount++;
                 totals.ActualSavedBytes += totalSaved.Value;
             }
-
             if (stats.ReplacedOriginal && stats.CleanupSavedBytes is not null)
                 totals.CleanupSavedBytes += stats.CleanupSavedBytes.Value;
-
             if (stats.ReplacedOriginal && stats.TranscodeSavedBytes is not null)
                 totals.TranscodeSavedBytes += stats.TranscodeSavedBytes.Value;
 
@@ -133,21 +118,12 @@ public static class MediaProcessingStatsStore
             }
         }
 
-        totals.OriginalLanguageDistinctCount = languageCounts.Count;
-        if (languageCounts.Count > 0)
-        {
-            totals.OriginalLanguage = languageCounts
-                .OrderByDescending(x => x.Value)
-                .ThenBy(x => x.Key)
-                .First()
-                .Key;
-        }
-
         if (!outputKnown && totals.ActualOutputSizeBytes == 0)
             totals.ActualOutputSizeBytes = null;
 
         return totals;
     }
+
     public static PlanSummary ReadPlanSummary(string? planJson)
     {
         if (string.IsNullOrWhiteSpace(planJson))

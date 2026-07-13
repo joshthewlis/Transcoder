@@ -217,11 +217,4 @@ public sealed class MediaBrowserTotalsDto
     public long TranscodeSavedBytes { get; set; }
     public long EstimatedCleanupSavingsBytes { get; set; }
     public bool EstimatedCleanupSavingsComplete { get; set; } = true;
-
-    // Summary for folder rows in the Media Browser.
-    // OriginalLanguage is the most common known original language in this scope.
-    public string? OriginalLanguage { get; set; }
-    public int OriginalLanguageKnownCount { get; set; }
-    public int OriginalLanguageUnknownCount { get; set; }
-    public int OriginalLanguageDistinctCount { get; set; }
 }
