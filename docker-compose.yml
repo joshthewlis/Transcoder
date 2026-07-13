@@ -15,6 +15,14 @@ services:
       Transcoder__Storage__WorkingRoot: /mnt/media/.transcoder/working
       Transcoder__Storage__StagingRoot: /mnt/media/.transcoder/staging
       Transcoder__Storage__KeepOriginalsQuarantine: "false"
+
+      Transcoder__Storage__StorageMapPath: /mnt/media/.transcoder/storage-map.tsv
+      Transcoder__Storage__StorageAwareScheduling: "true"
+      Transcoder__Storage__MaxActiveSourceJobsPerStorageKey: "2"
+      Transcoder__Storage__PreferLeastBusyStorageKey: "true"
+      Transcoder__Storage__UseParentFolderForUnknownStorageKey: "true"
+      Transcoder__Storage__UnknownStorageKeyFolderDepth: "2"
+
       Transcoder__ActiveHours__Enabled: "true"
       Transcoder__ActiveHours__TimeZoneId: Europe/London
       Transcoder__ActiveHours__Start: "08:30"
