@@ -139,14 +139,9 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
                 {
                     var execution = await settings.GetExecutionSettingsAsync(cancellationToken);
                     var activeHours = ActiveHoursEvaluator.Evaluate(execution, DateTime.UtcNow);
-                    if (activeHours.AllowStagedWork)
-                    {
-                        await db.SaveChangesAsync(cancellationToken);
-                        await replacement.ReplaceMediaAsync(media.Id, cancellationToken);
-                        return true;
-                    }
-
-                    job.LastMessage = $"Replacement deferred by active hours. {activeHours.Message}";
+                    job.LastMessage = activeHours.AllowStagedWork
+                        ? "Cleanup/transcode staged. Replacement will be handled by the auto-replace background service."
+                        : $"Replacement deferred by active hours. {activeHours.Message}";
                 }
             }
         }
@@ -166,6 +161,12 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         var job = await db.Jobs.FirstOrDefaultAsync(x => x.Id == jobId, cancellationToken);
         if (job is null || job.LeaseId != request.LeaseId)
             return false;
+
+        // A worker may report failure after its CompleteJob HTTP request timed out,
+        // even though the server has already accepted and saved completion. Never
+        // allow a late failure report to undo a completed job or requeue stale work.
+        if (job.Status == JobStatus.Completed)
+            return true;
 
         job.LastError = $"{request.ErrorCode}: {request.Message}";
         job.LastMessage = request.Details;
