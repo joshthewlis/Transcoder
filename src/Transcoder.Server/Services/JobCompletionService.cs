@@ -8,7 +8,7 @@ using Transcoder.Server.Options;
 
 namespace Transcoder.Server.Services;
 
-public sealed class JobCompletionService(TranscoderDbContext db, IOptions<WorkerTimingOptions> timingOptions, TranscodePlanService planner, SystemSettingsService settings, ReplacementService replacement)
+public sealed class JobCompletionService(TranscoderDbContext db, IOptions<WorkerTimingOptions> timingOptions, TranscodePlanService planner, SystemSettingsService settings)
 {
     public async Task<bool> ProgressAsync(long jobId, JobProgressRequest request, CancellationToken cancellationToken = default)
     {
@@ -137,11 +137,10 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
                 }
                 else if (await settings.GetProcessingModeAsync(cancellationToken) == ProcessingMode.ReplaceApproved)
                 {
-                    var execution = await settings.GetExecutionSettingsAsync(cancellationToken);
-                    var activeHours = ActiveHoursEvaluator.Evaluate(execution, DateTime.UtcNow);
-                    job.LastMessage = activeHours.AllowStagedWork
-                        ? "Cleanup/transcode staged. Replacement will be handled by the auto-replace background service."
-                        : $"Replacement deferred by active hours. {activeHours.Message}";
+                    // Replacement is intentionally decoupled from the worker completion callback.
+                    // AutoReplaceBackgroundService will pick this staged item up separately so the
+                    // worker is never blocked waiting for a slow NAS/SMB move/replace operation.
+                    job.LastMessage = "Output staged; replacement queued for the background auto-replace service.";
                 }
             }
         }
@@ -162,9 +161,8 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         if (job is null || job.LeaseId != request.LeaseId)
             return false;
 
-        // A worker may report failure after its CompleteJob HTTP request timed out,
-        // even though the server has already accepted and saved completion. Never
-        // allow a late failure report to undo a completed job or requeue stale work.
+        // A worker may time out after CompleteAsync has already committed success. Never let
+        // a late failure callback undo a completed/staged/replaced job.
         if (job.Status == JobStatus.Completed)
             return true;
 

@@ -29,8 +29,8 @@ public sealed class ReplacementService(
         if (!policy.Output.ReplaceOriginals)
             return Reject(media.Id, "This library does not allow replacing originals. Enable Output > Replace originals first.", media.Status);
 
-        if (media.Status is not (MediaStatus.StagedCleaned or MediaStatus.Staged or MediaStatus.Approved))
-            return Reject(media.Id, $"Media is {media.Status}; only staged/approved media can replace originals.", media.Status);
+        if (media.Status is not (MediaStatus.StagedCleaned or MediaStatus.Staged or MediaStatus.Approved or MediaStatus.ReplaceFailed))
+            return Reject(media.Id, $"Media is {media.Status}; only staged/approved or replace-failed media can replace originals.", media.Status);
 
         var stats = MediaProcessingStatsStore.Read(media);
         var stagingPath = !string.IsNullOrWhiteSpace(media.StagingPath) ? media.StagingPath : stats.StagingOutputPath;
@@ -71,7 +71,7 @@ public sealed class ReplacementService(
             backupPath);
 
         var originalPath = media.FullPath;
-        var wasCleanup = media.Status == MediaStatus.StagedCleaned;
+        var wasCleanup = media.Status == MediaStatus.StagedCleaned || stats.LastCompletedWorkType == JobType.Cleanup;
         try
         {
             MoveFile(originalPath, backupPath, overwrite: false);
@@ -132,9 +132,7 @@ public sealed class ReplacementService(
             media.Status = wasCleanup ? MediaStatus.ReplacedCleaned : MediaStatus.ReplacedTranscoded;
             media.UpdatedUtc = DateTime.UtcNow;
 
-            // Replacement may create the new file on a different Unraid disk depending on share allocation settings.
-            // Mark the imported physical-disk mapping stale so the next storage-map import refreshes it.
-            await StorageMapImportService.MarkMediaStorageStaleAsync(db, media.Id, cancellationToken);
+            await ResolveReplaceFailureReviewsAsync(media.Id, cancellationToken);
 
             await db.SaveChangesAsync(cancellationToken);
             return new ReplaceMediaResultDto
@@ -159,16 +157,64 @@ public sealed class ReplacementService(
             logger.LogError(ex, "Failed to replace original for media {MediaId}", media.Id);
             media.Status = MediaStatus.ReplaceFailed;
             media.UpdatedUtc = DateTime.UtcNow;
+            await UpsertReplaceFailureReviewAsync(media.Id, ex.Message, stagingPath, originalPath, backupPath, cancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
+            return Reject(media.Id, $"Replace failed: {ex.Message}", media.Status);
+        }
+    }
+
+    public static bool IsReplaceFailureReason(string? reason)
+        => string.Equals(reason, "Replace original failed.", StringComparison.OrdinalIgnoreCase);
+
+    private async Task UpsertReplaceFailureReviewAsync(
+        long mediaId,
+        string error,
+        string stagingPath,
+        string originalPath,
+        string backupPath,
+        CancellationToken cancellationToken)
+    {
+        var details = JsonSerializer.Serialize(new
+        {
+            error,
+            stagingPath,
+            originalPath,
+            backupPath,
+            retryable = true,
+            failedUtc = DateTime.UtcNow
+        }, JsonOptions);
+
+        var review = await db.ReviewItems
+            .FirstOrDefaultAsync(x => x.MediaItemId == mediaId && !x.Resolved && x.Reason == "Replace original failed.", cancellationToken);
+
+        if (review is null)
+        {
             db.ReviewItems.Add(new ReviewItemEntity
             {
-                MediaItemId = media.Id,
+                MediaItemId = mediaId,
                 ReviewType = ReviewType.OutputValidationWarning,
                 Severity = ReviewSeverity.Blocking,
                 Reason = "Replace original failed.",
-                DetailsJson = JsonSerializer.Serialize(new { error = ex.Message, stagingPath, originalPath, backupPath }, JsonOptions)
+                DetailsJson = details
             });
-            await db.SaveChangesAsync(cancellationToken);
-            return Reject(media.Id, $"Replace failed: {ex.Message}", media.Status);
+            return;
+        }
+
+        review.ReviewType = ReviewType.OutputValidationWarning;
+        review.Severity = ReviewSeverity.Blocking;
+        review.DetailsJson = details;
+    }
+
+    private async Task ResolveReplaceFailureReviewsAsync(long mediaId, CancellationToken cancellationToken)
+    {
+        var reviews = await db.ReviewItems
+            .Where(x => x.MediaItemId == mediaId && !x.Resolved && x.Reason == "Replace original failed.")
+            .ToListAsync(cancellationToken);
+
+        foreach (var review in reviews)
+        {
+            review.Resolved = true;
+            review.ResolvedUtc = DateTime.UtcNow;
         }
     }
 

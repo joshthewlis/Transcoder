@@ -1675,6 +1675,10 @@ function renderReviewMedia(review) {
   return `<strong>${escapeHtml(name)}</strong><br><small>ID ${review.mediaItemId}</small>${path}`;
 }
 
+function isReplaceFailureReview(review) {
+  return String(review.reason || '').toLowerCase() === 'replace original failed.';
+}
+
 function renderReviewActions(review) {
   const name = review.mediaName || review.mediaRelativePath || `Media ${review.mediaItemId}`;
   const subtitle = [
@@ -1684,6 +1688,15 @@ function renderReviewActions(review) {
   const titleArg = jsStringArg(`${name} Plan`);
   const subtitleArg = jsStringArg(subtitle);
 
+  if (isReplaceFailureReview(review)) {
+    return `
+      <div class="button-row">
+        <button class="button primary" onclick="retryReplaceReview(${review.id})">Try Again</button>
+        <button class="button" onclick="showMediaPlan(${review.mediaItemId}, ${titleArg}, ${subtitleArg})">View Plan</button>
+        <button class="button" onclick="skipReview(${review.id})">Skip</button>
+      </div>`;
+  }
+
   return `
     <div class="button-row">
       <button class="button" onclick="showMediaPlan(${review.mediaItemId}, ${titleArg}, ${subtitleArg})">View Plan</button>
@@ -1691,6 +1704,22 @@ function renderReviewActions(review) {
       <button class="button" onclick="skipReview(${review.id})">Skip</button>
     </div>`;
 }
+
+window.retryReplaceReview = async (reviewId) => {
+  if (!confirm('Retry replacing the original using the existing staged output?\n\nThis does not run cleanup/transcode again. It only retries the staged-file replacement.')) return;
+
+  try {
+    const result = await api(`/api/review/${reviewId}/retry-replace`, { method: 'POST' });
+    alert(result?.message || 'Replacement retry completed.');
+  } catch (error) {
+    alert(`Replacement retry failed: ${error.message || error}`);
+  }
+
+  await refreshReview();
+  await refreshMedia();
+  await refreshJobs();
+  await refreshStatus();
+};
 
 window.approveReview = async (reviewId) => {
   await api(`/api/review/${reviewId}/approve`, { method: 'POST' });

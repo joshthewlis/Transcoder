@@ -4,12 +4,13 @@ using Microsoft.EntityFrameworkCore;
 using Transcoder.Contracts;
 using Transcoder.Server.Data;
 using Transcoder.Server.Data.Entities;
+using Transcoder.Server.Services;
 
 namespace Transcoder.Server.Controllers;
 
 [ApiController]
 [Route("api/review")]
-public sealed class ReviewController(TranscoderDbContext db) : ControllerBase
+public sealed class ReviewController(TranscoderDbContext db, ReplacementService replacement) : ControllerBase
 {
     [HttpGet]
     public async Task<ActionResult<PagedResultDto<ReviewItemDto>>> List([FromQuery] int page = 1, [FromQuery] int pageSize = 100, CancellationToken cancellationToken = default)
@@ -85,6 +86,41 @@ public sealed class ReviewController(TranscoderDbContext db) : ControllerBase
         item.ResolvedUtc = DateTime.UtcNow;
         await db.SaveChangesAsync(cancellationToken);
         return NoContent();
+    }
+
+    [HttpPost("{reviewId:long}/retry-replace")]
+    public async Task<ActionResult<ReplaceMediaResultDto>> RetryReplace(long reviewId, CancellationToken cancellationToken)
+    {
+        var item = await db.ReviewItems.FirstOrDefaultAsync(x => x.Id == reviewId && !x.Resolved, cancellationToken);
+        if (item is null) return NotFound();
+
+        if (!ReplacementService.IsReplaceFailureReason(item.Reason))
+            return BadRequest(new ReplaceMediaResultDto
+            {
+                MediaId = item.MediaItemId,
+                Accepted = false,
+                Replaced = false,
+                Message = "This review item is not a failed replacement review."
+            });
+
+        var result = await replacement.ReplaceMediaAsync(item.MediaItemId, cancellationToken);
+
+        if (result.Replaced)
+        {
+            var now = DateTime.UtcNow;
+            var reviews = await db.ReviewItems
+                .Where(x => x.MediaItemId == item.MediaItemId && !x.Resolved && x.Reason == "Replace original failed.")
+                .ToListAsync(cancellationToken);
+
+            foreach (var review in reviews)
+            {
+                review.Resolved = true;
+                review.ResolvedUtc = now;
+            }
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        return result.Replaced ? Ok(result) : BadRequest(result);
     }
 
     [HttpPost("{reviewId:long}/stream-actions")]
