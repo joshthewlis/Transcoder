@@ -46,7 +46,10 @@ services:
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-1
       Transcoder__WorkerName: Probe Worker 1
-      Transcoder__Roles: Prober, Transcoder, Validator
+      Transcoder__Roles: Prober, Cleanup, Validator
+      Transcoder__Transcoding__AllowGpuEncoding: "false"
+      Transcoder__Transcoding__AllowCpuEncoding: "true"
+
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
@@ -83,7 +86,10 @@ services:
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-2
       Transcoder__WorkerName: Probe Worker 2
-      Transcoder__Roles: Prober, Transcoder, Validator
+      Transcoder__Roles: Prober, Cleanup, Validator
+      Transcoder__Transcoding__AllowGpuEncoding: "false"
+      Transcoder__Transcoding__AllowCpuEncoding: "true"
+
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
       Transcoder__Limits__MaxTranscodeJobs: 0
@@ -120,7 +126,9 @@ services:
       Transcoder__ApiKey: dev-worker-key
       Transcoder__WorkerId: probe-worker-3
       Transcoder__WorkerName: Probe Worker 3
-      Transcoder__Roles: Prober, Transcoder, Validator
+      Transcoder__Roles: Prober, Cleanup, Validator
+      Transcoder__Transcoding__AllowGpuEncoding: "false"
+      Transcoder__Transcoding__AllowCpuEncoding: "true"
 
       Transcoder__Limits__MaxProbeJobs: 10
       Transcoder__Limits__MaxPlanReviewJobs: 10
