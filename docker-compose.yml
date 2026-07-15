@@ -55,7 +55,7 @@ services:
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
 
-      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__Enabled: "false"
       Transcoder__SourceCopy__MaxConcurrentCopies: 1
       Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
       Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
@@ -95,7 +95,7 @@ services:
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
 
-      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__Enabled: "false"
       Transcoder__SourceCopy__MaxConcurrentCopies: 1
       Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
       Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
@@ -135,7 +135,7 @@ services:
       Transcoder__Limits__MaxTranscodeJobs: 0
       Transcoder__Limits__MaxValidationJobs: 0
 
-      Transcoder__SourceCopy__Enabled: "true"
+      Transcoder__SourceCopy__Enabled: "false"
       Transcoder__SourceCopy__MaxConcurrentCopies: 1
       Transcoder__SourceCopy__MaxBufferedLocalWorkItems: 4
       Transcoder__SourceCopy__DeleteLocalSourceAfterFfmpeg: "true"
