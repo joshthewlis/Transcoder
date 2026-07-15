@@ -138,6 +138,52 @@ public sealed class PilotRunResultDto
     public List<string> Messages { get; set; } = [];
 }
 
+
+
+public sealed class QueueMediaFolderWorkRequest
+{
+    public int LibraryId { get; set; }
+    public string? Path { get; set; }
+    public bool QueueCleanup { get; set; } = true;
+    public bool QueueTranscode { get; set; }
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.Normal;
+}
+
+public sealed class QueueMediaFolderWorkResultDto
+{
+    public int LibraryId { get; set; }
+    public string Path { get; set; } = string.Empty;
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.Normal;
+    public int Considered { get; set; }
+    public int QueuedCleanup { get; set; }
+    public int QueuedTranscode { get; set; }
+    public int AlreadyQueued { get; set; }
+    public int PrioritizedQueuedJobs { get; set; }
+    public int Skipped { get; set; }
+    public int Failed { get; set; }
+    public long EstimatedCleanupSavingsBytes { get; set; }
+    public List<string> Messages { get; set; } = [];
+}
+
+public sealed class SetMediaFolderPriorityRequest
+{
+    public int LibraryId { get; set; }
+    public string? Path { get; set; }
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.High;
+    public bool Cleanup { get; set; } = true;
+    public bool Transcode { get; set; } = true;
+}
+
+public sealed class SetMediaFolderPriorityResultDto
+{
+    public int LibraryId { get; set; }
+    public string Path { get; set; } = string.Empty;
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.High;
+    public int MediaItemsConsidered { get; set; }
+    public int QueuedJobsUpdated { get; set; }
+    public List<string> Messages { get; set; } = [];
+}
+
 public sealed class ReplaceMediaResultDto
 {
     public long MediaId { get; set; }

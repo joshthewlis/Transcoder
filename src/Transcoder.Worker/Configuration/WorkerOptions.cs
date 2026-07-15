@@ -8,7 +8,7 @@ public sealed class WorkerOptions
     public string ApiKey { get; set; } = "dev-worker-key";
     public string WorkerId { get; set; } = Environment.MachineName.ToLowerInvariant();
     public string WorkerName { get; set; } = Environment.MachineName;
-    public WorkerRole Roles { get; set; } = WorkerRole.Prober;
+    public WorkerRole Roles { get; set; } = WorkerRole.Prober | WorkerRole.Cleanup | WorkerRole.Transcoder | WorkerRole.Validator;
     public string FfmpegPath { get; set; } = "ffmpeg";
     public string FfprobePath { get; set; } = "ffprobe";
     public bool StopIfRequiredToolsMissing { get; set; } = true;

@@ -13,8 +13,7 @@ public sealed class JobLeaseService(
     SystemSettingsService settings,
     PathCheckDefinitionService pathChecks,
     IOptions<WorkerTimingOptions> timingOptions,
-    IOptions<TranscoderServerOptions> serverOptions,
-    IOptions<StorageOptions> storageOptions)
+    IOptions<TranscoderServerOptions> serverOptions)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -76,12 +75,6 @@ public sealed class JobLeaseService(
             && (j.Status == JobStatus.Leased || j.Status == JobStatus.Running)
             && j.JobType == JobType.Transcode, cancellationToken);
 
-        var storageAwareScheduling = storageOptions.Value.StorageAwareScheduling;
-        var activeStorageCounts = storageAwareScheduling
-            ? await GetActiveStorageCountsAsync(cancellationToken)
-            : new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var leasedStorageCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
         var stagedWorkPausedByActiveHours = false;
 
         foreach (var item in request.Requests.Where(x => x.MaxJobs > 0))
@@ -95,10 +88,15 @@ public sealed class JobLeaseService(
                 continue;
             }
 
-            var candidates = await GetLeaseCandidatesAsync(item.JobType, item.MaxJobs, activeStorageCounts, cancellationToken);
-            var candidateStorageKeys = storageAwareScheduling && IsSourceWorkJob(item.JobType)
-                ? await GetStorageKeysForJobsAsync(candidates, cancellationToken)
-                : new Dictionary<long, string>();
+            var candidateLimit = Math.Max(item.MaxJobs * 25, 100);
+            var candidates = (await db.Jobs
+                .Where(j => j.Status == JobStatus.Queued && j.JobType == item.JobType)
+                .OrderBy(j => j.CreatedUtc)
+                .Take(candidateLimit)
+                .ToListAsync(cancellationToken))
+                .OrderByDescending(j => JobPriorityHelper.ReadPriorityValue(j.PayloadJson))
+                .ThenBy(j => j.CreatedUtc)
+                .ToList();
 
             foreach (var job in candidates)
             {
@@ -112,13 +110,6 @@ public sealed class JobLeaseService(
                     break;
 
                 if (!WorkerCanRunJob(worker, request.Capabilities, job))
-                    continue;
-
-                var storageKey = storageAwareScheduling && IsSourceWorkJob(job.JobType)
-                    ? candidateStorageKeys.GetValueOrDefault(job.Id, "unknown")
-                    : null;
-
-                if (!CanLeaseStorageKey(storageKey, activeStorageCounts, leasedStorageCounts))
                     continue;
 
                 var leaseId = Guid.NewGuid().ToString("N");
@@ -140,9 +131,6 @@ public sealed class JobLeaseService(
                     LeaseExpiresUtc = job.LeaseExpiresUtc.Value,
                     Payload = JsonSerializer.Deserialize<System.Text.Json.JsonElement>(job.PayloadJson, JsonOptions)
                 });
-
-                if (!string.IsNullOrWhiteSpace(storageKey))
-                    leasedStorageCounts[storageKey] = leasedStorageCounts.GetValueOrDefault(storageKey) + 1;
             }
         }
 
@@ -178,154 +166,6 @@ public sealed class JobLeaseService(
 
         return response;
     }
-
-    private async Task<List<JobEntity>> GetLeaseCandidatesAsync(
-        JobType jobType,
-        int maxJobs,
-        IReadOnlyDictionary<string, int> activeStorageCounts,
-        CancellationToken cancellationToken)
-    {
-        var take = Math.Max(maxJobs * 200, 1000);
-        var candidates = await db.Jobs
-            .Where(j => j.Status == JobStatus.Queued && j.JobType == jobType)
-            .OrderBy(j => j.CreatedUtc)
-            .Take(take)
-            .ToListAsync(cancellationToken);
-
-        if (!storageOptions.Value.StorageAwareScheduling || !IsSourceWorkJob(jobType) || candidates.Count <= 1)
-            return candidates;
-
-        await StorageMapImportService.EnsureTableAsync(db, cancellationToken);
-        var storageKeys = await GetStorageKeysForJobsAsync(candidates, cancellationToken);
-
-        return candidates
-            .OrderBy(j => storageOptions.Value.PreferLeastBusyStorageKey ? activeStorageCounts.GetValueOrDefault(storageKeys.GetValueOrDefault(j.Id, "unknown")) : 0)
-            .ThenBy(j => storageKeys.GetValueOrDefault(j.Id, "unknown"), StringComparer.OrdinalIgnoreCase)
-            .ThenBy(j => j.CreatedUtc)
-            .ToList();
-    }
-
-    private async Task<Dictionary<string, int>> GetActiveStorageCountsAsync(CancellationToken cancellationToken)
-    {
-        if (!storageOptions.Value.StorageAwareScheduling)
-            return new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-        await StorageMapImportService.EnsureTableAsync(db, cancellationToken);
-
-        var activeJobs = await db.Jobs.AsNoTracking()
-            .Where(j => j.MediaItemId != null
-                && (j.JobType == JobType.Cleanup || j.JobType == JobType.Transcode)
-                && (j.Status == JobStatus.Leased || j.Status == JobStatus.Running))
-            .ToListAsync(cancellationToken);
-
-        var storageKeys = await GetStorageKeysForJobsAsync(activeJobs, cancellationToken);
-        return storageKeys.Values
-            .GroupBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(x => x.Key, x => x.Count(), StringComparer.OrdinalIgnoreCase);
-    }
-
-    private async Task<Dictionary<long, string>> GetStorageKeysForJobsAsync(IReadOnlyCollection<JobEntity> jobs, CancellationToken cancellationToken)
-    {
-        var result = new Dictionary<long, string>();
-        if (jobs.Count == 0)
-            return result;
-
-        var mediaIds = jobs
-            .Where(x => x.MediaItemId is not null)
-            .Select(x => x.MediaItemId!.Value)
-            .Distinct()
-            .ToList();
-
-        if (mediaIds.Count == 0)
-        {
-            foreach (var job in jobs)
-                result[job.Id] = "unknown";
-            return result;
-        }
-
-        var mediaById = await db.MediaItems.AsNoTracking()
-            .Where(x => mediaIds.Contains(x.Id))
-            .Select(x => new { x.Id, x.RelativePath })
-            .ToDictionaryAsync(x => x.Id, cancellationToken);
-
-        var storageByMediaId = await QueryMediaStorageAsync(mediaIds, cancellationToken);
-
-        foreach (var job in jobs)
-        {
-            if (job.MediaItemId is null || !mediaById.TryGetValue(job.MediaItemId.Value, out var media))
-            {
-                result[job.Id] = "unknown";
-                continue;
-            }
-
-            if (storageByMediaId.TryGetValue(media.Id, out var storage)
-                && !storage.Stale
-                && !string.IsNullOrWhiteSpace(storage.StorageKey))
-            {
-                result[job.Id] = storage.StorageKey!;
-                continue;
-            }
-
-            result[job.Id] = storageOptions.Value.UseParentFolderForUnknownStorageKey
-                ? StorageMapImportService.BuildFallbackStorageKey(media.RelativePath, storageOptions.Value.UnknownStorageKeyFolderDepth)
-                : "unknown";
-        }
-
-        return result;
-    }
-
-    private async Task<Dictionary<long, MediaStorageLookup>> QueryMediaStorageAsync(IReadOnlyCollection<long> mediaIds, CancellationToken cancellationToken)
-    {
-        var result = new Dictionary<long, MediaStorageLookup>();
-        if (mediaIds.Count == 0)
-            return result;
-
-        await StorageMapImportService.EnsureTableAsync(db, cancellationToken);
-
-        var idList = string.Join(",", mediaIds.Distinct().Select(x => x.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-        var connection = db.Database.GetDbConnection();
-        var shouldClose = connection.State != System.Data.ConnectionState.Open;
-        if (shouldClose)
-            await connection.OpenAsync(cancellationToken);
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"select MediaItemId, SourceStorageKey, SourceStorageStale from MediaStorage where MediaItemId in ({idList})";
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                var mediaItemId = reader.GetInt64(0);
-                var storageKey = reader.IsDBNull(1) ? null : reader.GetString(1);
-                var stale = !reader.IsDBNull(2) && Convert.ToInt32(reader.GetValue(2), System.Globalization.CultureInfo.InvariantCulture) != 0;
-                result[mediaItemId] = new MediaStorageLookup(storageKey, stale);
-            }
-        }
-        finally
-        {
-            if (shouldClose)
-                await connection.CloseAsync();
-        }
-
-        return result;
-    }
-
-    private bool CanLeaseStorageKey(string? storageKey, IReadOnlyDictionary<string, int> activeStorageCounts, IReadOnlyDictionary<string, int> leasedStorageCounts)
-    {
-        if (string.IsNullOrWhiteSpace(storageKey))
-            return true;
-
-        if (!storageOptions.Value.StorageAwareScheduling || storageOptions.Value.MaxActiveSourceJobsPerStorageKey <= 0)
-            return true;
-
-        var active = activeStorageCounts.GetValueOrDefault(storageKey);
-        var reserved = leasedStorageCounts.GetValueOrDefault(storageKey);
-        return active + reserved < storageOptions.Value.MaxActiveSourceJobsPerStorageKey;
-    }
-
-    private static bool IsSourceWorkJob(JobType jobType) => jobType is JobType.Cleanup or JobType.Transcode;
-
-    private sealed record MediaStorageLookup(string? StorageKey, bool Stale);
 
     private JobLeaseBatchResponse BuildBaseResponse(WorkerEntity worker)
     {
@@ -535,7 +375,7 @@ public sealed class JobLeaseService(
     {
         JobType.Probe => roles.HasFlag(WorkerRole.Prober),
         JobType.PlanReview => roles.HasFlag(WorkerRole.Prober),
-        JobType.Cleanup => roles.HasFlag(WorkerRole.Transcoder),
+        JobType.Cleanup => roles.HasFlag(WorkerRole.Cleanup),
         JobType.Transcode => roles.HasFlag(WorkerRole.Transcoder),
         JobType.ValidateOutput => roles.HasFlag(WorkerRole.Validator),
         _ => false

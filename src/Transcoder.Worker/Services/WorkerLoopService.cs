@@ -440,11 +440,10 @@ public sealed class WorkerLoopService(
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Probe, MaxJobs = capacity.Probe });
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.PlanReview, MaxJobs = capacity.PlanReview });
         }
-        if (_options.Roles.HasFlag(WorkerRole.Transcoder))
-        {
+        if (_options.Roles.HasFlag(WorkerRole.Cleanup))
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Cleanup, MaxJobs = capacity.Cleanup });
+        if (_options.Roles.HasFlag(WorkerRole.Transcoder))
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Transcode, MaxJobs = capacity.Transcode });
-        }
         if (_options.Roles.HasFlag(WorkerRole.Validator))
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.ValidateOutput, MaxJobs = capacity.Validation });
         return requests.Where(x => x.MaxJobs > 0).ToList();

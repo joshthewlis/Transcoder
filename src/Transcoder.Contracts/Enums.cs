@@ -66,6 +66,9 @@ public enum WorkerRole
 {
     None = 0,
     Prober = 1,
+    // Runs stream cleanup/remux jobs only. This is safe for workers without a GPU.
+    Cleanup = 8,
+    // Runs video transcode jobs. Use this for workers with GPU access when profiles require GPU encoders.
     Transcoder = 2,
     Validator = 4
 }
@@ -112,6 +115,14 @@ public enum JobStatus
     Failed,
     Cancelled,
     Expired
+}
+
+public enum JobQueuePriority
+{
+    Low = 0,
+    Normal = 50,
+    High = 100,
+    Urgent = 200
 }
 
 public enum MediaStatus

@@ -401,8 +401,8 @@ public sealed class WorkersController(
         var options = requirementOptions.Value;
         var errors = new List<string>();
 
-        if (options.RequireFfmpegForTranscoderRole && request.Roles.HasFlag(WorkerRole.Transcoder) && !request.Capabilities.Ffmpeg.Available)
-            errors.Add("Worker has Transcoder role but ffmpeg is not available.");
+        if (options.RequireFfmpegForTranscoderRole && (request.Roles.HasFlag(WorkerRole.Transcoder) || request.Roles.HasFlag(WorkerRole.Cleanup)) && !request.Capabilities.Ffmpeg.Available)
+            errors.Add("Worker has Cleanup/Transcoder role but ffmpeg is not available.");
 
         if (options.RequireFfprobeForProberRole && request.Roles.HasFlag(WorkerRole.Prober) && !request.Capabilities.Ffprobe.Available)
             errors.Add("Worker has Prober role but ffprobe is not available.");

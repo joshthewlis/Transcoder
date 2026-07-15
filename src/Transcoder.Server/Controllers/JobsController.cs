@@ -107,6 +107,26 @@ public sealed class JobsController(TranscoderDbContext db, JobLeaseService lease
         return NoContent();
     }
 
+    [HttpPost("{jobId:long}/priority")]
+    public async Task<ActionResult<object>> SetPriority(long jobId, SetJobPriorityRequest request, CancellationToken cancellationToken)
+    {
+        var job = await db.Jobs.FirstOrDefaultAsync(x => x.Id == jobId, cancellationToken);
+        if (job is null) return NotFound();
+
+        JobPriorityHelper.SetPriority(job, request.Priority);
+        await db.SaveChangesAsync(cancellationToken);
+
+        return Ok(new
+        {
+            jobId = job.Id,
+            priority = JobPriorityHelper.ReadPriority(job.PayloadJson).ToString(),
+            appliedToQueue = job.Status == JobStatus.Queued,
+            message = job.Status == JobStatus.Queued
+                ? $"Job {job.Id} priority set to {request.Priority}."
+                : $"Job {job.Id} priority metadata set to {request.Priority}, but it is already {job.Status}."
+        });
+    }
+
     private async Task<List<JobDto>> ToDtosAsync(IReadOnlyCollection<JobEntity> jobs, CancellationToken cancellationToken)
     {
         var libraryIds = jobs.Select(x => x.LibraryId).OfType<int>().Distinct().ToList();
@@ -152,6 +172,7 @@ public sealed class JobsController(TranscoderDbContext db, JobLeaseService lease
             RequiredEncoderEngine = ReadRequiredEncoderEngine(job),
             LeaseId = job.LeaseId,
             LeasedByWorkerId = job.LeasedByWorkerId,
+            Priority = JobPriorityHelper.ReadPriority(job.PayloadJson),
             AttemptNumber = job.AttemptNumber,
             MaxAttempts = job.MaxAttempts,
             Progress = job.Progress,

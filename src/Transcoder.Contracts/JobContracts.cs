@@ -84,6 +84,7 @@ public sealed class JobDto
     public EncoderEngine RequiredEncoderEngine { get; set; } = EncoderEngine.Unknown;
     public string? LeaseId { get; set; }
     public string? LeasedByWorkerId { get; set; }
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.Normal;
     public int AttemptNumber { get; set; }
     public int MaxAttempts { get; set; }
     public double? Progress { get; set; }
@@ -91,4 +92,10 @@ public sealed class JobDto
     public string? LastError { get; set; }
     public DateTime CreatedUtc { get; set; }
     public DateTime? CompletedUtc { get; set; }
+}
+
+
+public sealed class SetJobPriorityRequest
+{
+    public JobQueuePriority Priority { get; set; } = JobQueuePriority.High;
 }

@@ -1092,20 +1092,42 @@ function jobColumns(options = {}) {
     { title: 'Library', render: j => j.libraryName ? escapeHtml(j.libraryName) : `<small>${j.libraryId ?? ''}</small>` },
     { title: 'Media', render: renderJobMedia },
     { title: 'Worker', key: 'leasedByWorkerId' },
+    { title: 'Priority', render: renderJobPriority },
     { title: 'Required', render: renderJobRequirement },
     { title: 'Attempt', render: j => `${j.attemptNumber}/${j.maxAttempts}` },
     { title: 'Progress', render: j => j.progress == null ? '' : `${Math.round(j.progress)}%` },
     { title: 'Error', key: 'lastError' },
-    { title: 'Created', render: j => date(j.createdUtc) }
+    { title: 'Created', render: j => date(j.createdUtc) },
+    { title: 'Actions', render: renderJobActions }
   ];
 
   if (compact) {
-    return columns.filter(c => !['Required', 'Attempt', 'Error'].includes(c.title));
+    return columns.filter(c => !['Required', 'Attempt', 'Error', 'Actions'].includes(c.title));
   }
 
   return columns;
 }
 
+
+function renderJobPriority(job) {
+  const priority = job.priority || 'Normal';
+  return priority && priority !== 'Normal' ? badge(priority) : '';
+}
+
+function renderJobActions(job) {
+  if (!job || job.status !== 'Queued') return '';
+  return `<div class="button-row"><button class="button" onclick="setJobPriority(${job.id}, 'High')">High</button><button class="button" onclick="setJobPriority(${job.id}, 'Urgent')">Urgent</button></div>`;
+}
+
+window.setJobPriority = async (jobId, priority = 'High') => {
+  try {
+    const result = await api(`/api/jobs/${jobId}/priority`, { method: 'POST', body: JSON.stringify({ priority }) });
+    if (result?.message) console.log(result.message);
+    await refreshJobs();
+  } catch (error) {
+    alert(error.message || error);
+  }
+};
 
 function renderJobRequirement(job) {
   if (!job.requiredEncoder && (!job.requiredEncoderEngine || job.requiredEncoderEngine === 'Unknown')) return '';
@@ -1175,6 +1197,22 @@ function ensureMediaBrowserControls() {
     queueCurrent.textContent = 'Queue Current Folder Cleanup';
     queueCurrent.addEventListener('click', () => window.queueMediaBrowserFolderCleanup(state.mediaBrowser.path || ''));
     row.appendChild(queueCurrent);
+
+    const queueCurrentHigh = document.createElement('button');
+    queueCurrentHigh.id = 'media-browser-queue-current-folder-high';
+    queueCurrentHigh.type = 'button';
+    queueCurrentHigh.className = 'button primary';
+    queueCurrentHigh.textContent = 'Queue Current Folder High';
+    queueCurrentHigh.addEventListener('click', () => window.queueMediaBrowserFolderHigh(state.mediaBrowser.path || ''));
+    row.appendChild(queueCurrentHigh);
+
+    const priorityCurrent = document.createElement('button');
+    priorityCurrent.id = 'media-browser-priority-current-folder';
+    priorityCurrent.type = 'button';
+    priorityCurrent.className = 'button';
+    priorityCurrent.textContent = 'Set Current Folder High';
+    priorityCurrent.addEventListener('click', () => window.setMediaBrowserFolderPriorityHigh(state.mediaBrowser.path || ''));
+    row.appendChild(priorityCurrent);
 
     const message = document.createElement('span');
     message.id = 'media-browser-action-message';
@@ -1252,7 +1290,7 @@ function renderBrowserLanguage(row) {
 function renderMediaBrowserActions(row) {
     if (row.kind === 'Folder') {
         const pathArg = jsStringArg(row.path);
-        return `<div class="button-row"><button class="button" onclick="openMediaBrowserPath(${pathArg})">Open</button><button class="button primary" onclick="queueMediaBrowserFolderCleanup(${pathArg})">Queue Cleanup</button></div>`;
+        return `<div class="button-row"><button class="button" onclick="openMediaBrowserPath(${pathArg})">Open</button><button class="button" onclick="queueMediaBrowserFolderCleanup(${pathArg})">Queue Cleanup</button><button class="button primary" onclick="queueMediaBrowserFolderHigh(${pathArg})">Queue High</button><button class="button" onclick="setMediaBrowserFolderPriorityHigh(${pathArg})">Priority High</button></div>`;
     }
     return row.media ? renderMediaActions(row.media) : '';
 }
@@ -1334,6 +1372,54 @@ window.queueMediaBrowserFolderCleanup = async (path = null) => {
         await refreshJobs();
     } catch (error) {
         mediaBrowserMessage(`Queue failed: ${error.message || error}`, 'bad');
+        alert(error.message || error);
+    }
+};
+
+window.queueMediaBrowserFolderHigh = async (path = null) => {
+    const libraryId = state.mediaBrowser.libraryId;
+    if (!libraryId) return;
+    const rootPath = path ?? state.mediaBrowser.path ?? '';
+    const scope = rootPath || 'entire selected library';
+    if (!confirm(`Queue cleanup/transcode work currently available under ${scope} as HIGH priority?
+
+This uses the stored plan for each file. Cleanup-first files will need a later re-plan before transcode can be queued.`)) return;
+
+    try {
+        mediaBrowserMessage(`Queueing high priority work for ${scope}...`);
+        const result = await api('/api/media/folder/queue', {
+            method: 'POST',
+            body: JSON.stringify({ libraryId, path: rootPath, queueCleanup: true, queueTranscode: true, priority: 'High' })
+        });
+        const summary = result.messages?.length ? result.messages.join('\n') : `Queued cleanup ${result.queuedCleanup || 0}, transcode ${result.queuedTranscode || 0}.`;
+        alert(`${summary}\n\nPriority updates: ${result.prioritizedQueuedJobs || 0}\nEstimated cleanup saving: ${formatBytes(result.estimatedCleanupSavingsBytes || 0)}`);
+        mediaBrowserMessage(`High priority queue complete · cleanup ${result.queuedCleanup || 0}, transcode ${result.queuedTranscode || 0}, already ${result.alreadyQueued || 0}`, 'ok');
+        await refreshMediaBrowser();
+        await refreshMedia();
+        await refreshJobs();
+    } catch (error) {
+        mediaBrowserMessage(`High priority queue failed: ${error.message || error}`, 'bad');
+        alert(error.message || error);
+    }
+};
+
+window.setMediaBrowserFolderPriorityHigh = async (path = null) => {
+    const libraryId = state.mediaBrowser.libraryId;
+    if (!libraryId) return;
+    const rootPath = path ?? state.mediaBrowser.path ?? '';
+    const scope = rootPath || 'entire selected library';
+    if (!confirm(`Set existing queued cleanup/transcode jobs under ${scope} to HIGH priority?`)) return;
+
+    try {
+        const result = await api('/api/media/folder/priority', {
+            method: 'POST',
+            body: JSON.stringify({ libraryId, path: rootPath, cleanup: true, transcode: true, priority: 'High' })
+        });
+        alert(result.messages?.join('\n') || `Updated ${result.queuedJobsUpdated || 0} queued job(s).`);
+        mediaBrowserMessage(`Priority high applied to ${result.queuedJobsUpdated || 0} queued job(s).`, 'ok');
+        await refreshJobs();
+    } catch (error) {
+        mediaBrowserMessage(`Priority update failed: ${error.message || error}`, 'bad');
         alert(error.message || error);
     }
 };
@@ -1675,10 +1761,6 @@ function renderReviewMedia(review) {
   return `<strong>${escapeHtml(name)}</strong><br><small>ID ${review.mediaItemId}</small>${path}`;
 }
 
-function isReplaceFailureReview(review) {
-  return String(review.reason || '').toLowerCase() === 'replace original failed.';
-}
-
 function renderReviewActions(review) {
   const name = review.mediaName || review.mediaRelativePath || `Media ${review.mediaItemId}`;
   const subtitle = [
@@ -1688,15 +1770,6 @@ function renderReviewActions(review) {
   const titleArg = jsStringArg(`${name} Plan`);
   const subtitleArg = jsStringArg(subtitle);
 
-  if (isReplaceFailureReview(review)) {
-    return `
-      <div class="button-row">
-        <button class="button primary" onclick="retryReplaceReview(${review.id})">Try Again</button>
-        <button class="button" onclick="showMediaPlan(${review.mediaItemId}, ${titleArg}, ${subtitleArg})">View Plan</button>
-        <button class="button" onclick="skipReview(${review.id})">Skip</button>
-      </div>`;
-  }
-
   return `
     <div class="button-row">
       <button class="button" onclick="showMediaPlan(${review.mediaItemId}, ${titleArg}, ${subtitleArg})">View Plan</button>
@@ -1704,22 +1777,6 @@ function renderReviewActions(review) {
       <button class="button" onclick="skipReview(${review.id})">Skip</button>
     </div>`;
 }
-
-window.retryReplaceReview = async (reviewId) => {
-  if (!confirm('Retry replacing the original using the existing staged output?\n\nThis does not run cleanup/transcode again. It only retries the staged-file replacement.')) return;
-
-  try {
-    const result = await api(`/api/review/${reviewId}/retry-replace`, { method: 'POST' });
-    alert(result?.message || 'Replacement retry completed.');
-  } catch (error) {
-    alert(`Replacement retry failed: ${error.message || error}`);
-  }
-
-  await refreshReview();
-  await refreshMedia();
-  await refreshJobs();
-  await refreshStatus();
-};
 
 window.approveReview = async (reviewId) => {
   await api(`/api/review/${reviewId}/approve`, { method: 'POST' });

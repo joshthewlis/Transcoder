@@ -292,6 +292,138 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
         return result.Replaced ? Ok(result) : BadRequest(result);
     }
 
+    [HttpPost("folder/queue")]
+    public async Task<ActionResult<QueueMediaFolderWorkResultDto>> QueueFolderWork(QueueMediaFolderWorkRequest request, CancellationToken cancellationToken)
+    {
+        if (request.LibraryId <= 0)
+            return BadRequest(new { message = "LibraryId is required." });
+        if (!request.QueueCleanup && !request.QueueTranscode)
+            return BadRequest(new { message = "QueueCleanup or QueueTranscode must be enabled." });
+
+        var exists = await db.Libraries.AsNoTracking().AnyAsync(x => x.Id == request.LibraryId, cancellationToken);
+        if (!exists) return NotFound(new { message = "Library was not found." });
+
+        var currentPath = NormalizeBrowserPath(request.Path);
+        var mediaItems = await db.MediaItems.AsNoTracking()
+            .Where(x => x.LibraryId == request.LibraryId && x.PlanJson != null && x.PlanJson != "")
+            .OrderBy(x => x.RelativePath)
+            .ToListAsync(cancellationToken);
+
+        mediaItems = mediaItems.Where(x => IsUnderBrowserPath(x.RelativePath, currentPath)).ToList();
+
+        var result = new QueueMediaFolderWorkResultDto
+        {
+            LibraryId = request.LibraryId,
+            Path = currentPath,
+            Priority = request.Priority,
+            Considered = mediaItems.Count
+        };
+
+        foreach (var media in mediaItems)
+        {
+            var planKind = MediaProcessingStatsStore.ReadPlanSummary(media.PlanJson).PlanKind ?? string.Empty;
+            var tried = false;
+
+            if (request.QueueCleanup && planKind.Equals("CleanupOnly", StringComparison.OrdinalIgnoreCase))
+            {
+                tried = true;
+                var queued = await planner.QueueCleanupFromExistingPlanAsync(media.Id, cancellationToken);
+                if (queued.Queued) result.QueuedCleanup++;
+                else if (queued.AlreadyQueued) result.AlreadyQueued++;
+                else result.Skipped++;
+
+                if (queued.Accepted)
+                    result.PrioritizedQueuedJobs += await SetQueuedJobPriorityForMediaAsync(media.Id, [JobType.Cleanup], request.Priority, cancellationToken);
+                else if (result.Messages.Count < 12)
+                    result.Messages.Add($"{media.RelativePath}: {queued.Message}");
+            }
+
+            if (request.QueueTranscode && planKind.Equals("Transcode", StringComparison.OrdinalIgnoreCase))
+            {
+                tried = true;
+                var queued = await planner.QueueTranscodeFromExistingPlanAsync(media.Id, cancellationToken);
+                if (queued.Queued) result.QueuedTranscode++;
+                else if (queued.AlreadyQueued) result.AlreadyQueued++;
+                else result.Skipped++;
+
+                if (queued.Accepted)
+                    result.PrioritizedQueuedJobs += await SetQueuedJobPriorityForMediaAsync(media.Id, [JobType.Transcode], request.Priority, cancellationToken);
+                else if (result.Messages.Count < 12)
+                    result.Messages.Add($"{media.RelativePath}: {queued.Message}");
+            }
+
+            if (!tried)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(media.PlanJson))
+                result.EstimatedCleanupSavingsBytes += Math.Max(0, MediaProcessingStatsStore.ReadPlanSummary(media.PlanJson).EstimatedRemovedBytes ?? 0);
+        }
+
+        if (result.Messages.Count == 0)
+        {
+            var scope = string.IsNullOrWhiteSpace(currentPath) ? "selected library" : currentPath;
+            result.Messages.Add($"Queued folder work for {scope}. Cleanup queued: {result.QueuedCleanup}. Transcode queued: {result.QueuedTranscode}. Already queued: {result.AlreadyQueued}. Priority updates: {result.PrioritizedQueuedJobs}.");
+            if (request.QueueCleanup && request.QueueTranscode)
+                result.Messages.Add("Only the current stored plan type can be queued. Cleanup-first files will need to be re-planned after cleanup replacement before transcode can be queued.");
+        }
+
+        return Accepted(result);
+    }
+
+    [HttpPost("folder/priority")]
+    public async Task<ActionResult<SetMediaFolderPriorityResultDto>> SetFolderPriority(SetMediaFolderPriorityRequest request, CancellationToken cancellationToken)
+    {
+        if (request.LibraryId <= 0)
+            return BadRequest(new { message = "LibraryId is required." });
+        if (!request.Cleanup && !request.Transcode)
+            return BadRequest(new { message = "Cleanup or Transcode must be enabled." });
+
+        var exists = await db.Libraries.AsNoTracking().AnyAsync(x => x.Id == request.LibraryId, cancellationToken);
+        if (!exists) return NotFound(new { message = "Library was not found." });
+
+        var currentPath = NormalizeBrowserPath(request.Path);
+        var mediaIds = await db.MediaItems.AsNoTracking()
+            .Where(x => x.LibraryId == request.LibraryId)
+            .Select(x => new { x.Id, x.RelativePath })
+            .ToListAsync(cancellationToken);
+
+        var selectedIds = mediaIds
+            .Where(x => IsUnderBrowserPath(x.RelativePath, currentPath))
+            .Select(x => x.Id)
+            .ToHashSet();
+
+        var jobTypes = new List<JobType>();
+        if (request.Cleanup) jobTypes.Add(JobType.Cleanup);
+        if (request.Transcode) jobTypes.Add(JobType.Transcode);
+
+        var jobs = selectedIds.Count == 0
+            ? new List<JobEntity>()
+            : await db.Jobs
+                .Where(x => x.MediaItemId != null && selectedIds.Contains(x.MediaItemId.Value) && x.Status == JobStatus.Queued && jobTypes.Contains(x.JobType))
+                .OrderBy(x => x.CreatedUtc)
+                .ToListAsync(cancellationToken);
+
+        foreach (var job in jobs)
+            JobPriorityHelper.SetPriority(job, request.Priority);
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        var result = new SetMediaFolderPriorityResultDto
+        {
+            LibraryId = request.LibraryId,
+            Path = currentPath,
+            Priority = request.Priority,
+            MediaItemsConsidered = selectedIds.Count,
+            QueuedJobsUpdated = jobs.Count
+        };
+        result.Messages.Add($"Priority set to {request.Priority} for {jobs.Count} queued cleanup/transcode job(s) under {(string.IsNullOrWhiteSpace(currentPath) ? "the selected library" : currentPath)}.");
+        return Ok(result);
+    }
+
+
     private static MediaItemDto ToDto(MediaItemEntity item)
     {
         var planSummary = MediaProcessingStatsStore.ReadPlanSummary(item.PlanJson);
@@ -338,6 +470,35 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
             CreatedUtc = item.CreatedUtc,
             UpdatedUtc = item.UpdatedUtc
         };
+    }
+
+
+
+    private async Task<int> SetQueuedJobPriorityForMediaAsync(long mediaId, IReadOnlyCollection<JobType> jobTypes, JobQueuePriority priority, CancellationToken cancellationToken)
+    {
+        if (priority == JobQueuePriority.Normal)
+            return 0;
+
+        var jobs = await db.Jobs
+            .Where(x => x.MediaItemId == mediaId && x.Status == JobStatus.Queued && jobTypes.Contains(x.JobType))
+            .ToListAsync(cancellationToken);
+
+        foreach (var job in jobs)
+            JobPriorityHelper.SetPriority(job, priority);
+
+        if (jobs.Count > 0)
+            await db.SaveChangesAsync(cancellationToken);
+
+        return jobs.Count;
+    }
+
+    private static bool IsUnderBrowserPath(string relativePath, string currentPath)
+    {
+        var normalized = NormalizeBrowserPath(relativePath);
+        if (string.IsNullOrWhiteSpace(currentPath))
+            return true;
+        return normalized.Equals(currentPath, StringComparison.OrdinalIgnoreCase)
+            || normalized.StartsWith(currentPath + "/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeBrowserPath(string? value) =>
