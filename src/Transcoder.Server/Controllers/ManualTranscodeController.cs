@@ -49,7 +49,7 @@ public sealed class ManualTranscodeController(TranscoderDbContext db, ILogger<Ma
         {
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 update ManualTranscodeSessions
-                set Status = {'Cancelled'}, FinishedUtc = {DateTime.UtcNow}, Notes = {'Replaced by a newer manual transcode baseline.'}
+                set Status = 'Cancelled', FinishedUtc = {DateTime.UtcNow}, Notes = 'Replaced by a newer manual transcode baseline.'
                 where Id = {existingOpen.Id};", cancellationToken);
         }
 
@@ -66,7 +66,7 @@ public sealed class ManualTranscodeController(TranscoderDbContext db, ILogger<Ma
         var now = DateTime.UtcNow;
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             insert into ManualTranscodeSessions (LibraryId, Path, ToolName, Status, CreatedUtc, Notes)
-            values ({request.LibraryId}, {path}, {toolName}, {'Open'}, {now}, {request.Notes});", cancellationToken);
+            values ({request.LibraryId}, {path}, {toolName}, 'Open', {now}, {request.Notes});", cancellationToken);
 
         var sessionId = await ExecuteScalarLongAsync("select last_insert_rowid();", cancellationToken);
 
@@ -75,7 +75,7 @@ public sealed class ManualTranscodeController(TranscoderDbContext db, ILogger<Ma
             await db.Database.ExecuteSqlInterpolatedAsync($@"
                 insert into ManualTranscodeSessionItems
                 (SessionId, MediaItemId, RelativePath, FullPath, BeforeSizeBytes, Status)
-                values ({sessionId}, {item.Id}, {item.RelativePath}, {item.FullPath}, {item.FileSizeBytes}, {'Captured'});", cancellationToken);
+                values ({sessionId}, {item.Id}, {item.RelativePath}, {item.FullPath}, {item.FileSizeBytes}, 'Captured');", cancellationToken);
         }
 
         await transaction.CommitAsync(cancellationToken);
@@ -220,7 +220,7 @@ public sealed class ManualTranscodeController(TranscoderDbContext db, ILogger<Ma
 
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             update ManualTranscodeSessions
-            set Status = {'Finished'}, FinishedUtc = {now}, ToolName = {effectiveToolName}, Notes = {request.Notes}
+            set Status = 'Finished', FinishedUtc = {now}, ToolName = {effectiveToolName}, Notes = {request.Notes}
             where Id = {session.Id};", cancellationToken);
 
         await db.SaveChangesAsync(cancellationToken);
@@ -258,7 +258,7 @@ public sealed class ManualTranscodeController(TranscoderDbContext db, ILogger<Ma
 
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             update ManualTranscodeSessions
-            set Status = {'Cancelled'}, FinishedUtc = {DateTime.UtcNow}, Notes = {request.Notes}
+            set Status = 'Cancelled', FinishedUtc = {DateTime.UtcNow}, Notes = {request.Notes}
             where Id = {session.Id};", cancellationToken);
 
         var result = await BuildSessionSummaryAsync(session.Id, cancellationToken);
