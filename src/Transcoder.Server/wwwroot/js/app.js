@@ -1158,17 +1158,108 @@ function updateMediaBrowserLibrarySelect() {
   }
 }
 
+function numberOrZero(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function mediaCurrentSizeBytes(media) {
+  return numberOrZero(media?.fileSizeBytes);
+}
+
+function mediaTotalSavedBytes(media) {
+  return numberOrZero(media?.actualTotalSavedBytes ?? media?.actualSavedBytes);
+}
+
+function mediaCleanupSavedBytes(media) {
+  return numberOrZero(media?.actualCleanupSavedBytes);
+}
+
+function mediaTranscodeSavedBytes(media) {
+  return numberOrZero(media?.actualTranscodeSavedBytes);
+}
+
+function mediaOriginalSizeBytes(media) {
+  const current = mediaCurrentSizeBytes(media);
+  const saved = mediaTotalSavedBytes(media);
+  const explicitOriginal = numberOrZero(media?.originalSizeBytes ?? media?.actualOriginalSizeBytes);
+  return Math.max(current, current + saved, explicitOriginal);
+}
+
+function browserCurrentSizeBytes(totals) {
+  // Existing browser totals use originalSizeBytes for the current on-disk size.
+  // Prefer a clearer field if the API starts returning one later.
+  return numberOrZero(totals?.currentSizeBytes ?? totals?.sizeBytes ?? totals?.originalSizeBytes);
+}
+
+function browserTotalSavedBytes(totals) {
+  return numberOrZero(totals?.actualSavedBytes ?? totals?.actualTotalSavedBytes);
+}
+
+function browserCleanupSavedBytes(totals) {
+  return numberOrZero(totals?.cleanupSavedBytes ?? totals?.actualCleanupSavedBytes);
+}
+
+function browserTranscodeSavedBytes(totals) {
+  return numberOrZero(totals?.transcodeSavedBytes ?? totals?.actualTranscodeSavedBytes);
+}
+
+function browserOriginalSizeBytes(totals) {
+  const current = browserCurrentSizeBytes(totals);
+  const saved = browserTotalSavedBytes(totals);
+  const explicitOriginal = numberOrZero(totals?.trueOriginalSizeBytes ?? totals?.actualOriginalSizeBytes);
+  return Math.max(current, current + saved, explicitOriginal);
+}
+
+function renderMediaOriginalSize(media) {
+  return formatBytes(mediaOriginalSizeBytes(media));
+}
+
+function renderMediaCurrentSize(media) {
+  return formatBytes(mediaCurrentSizeBytes(media));
+}
+
+function renderMediaCleanupSaved(media) {
+  return formatBytes(mediaCleanupSavedBytes(media));
+}
+
+function renderMediaTranscodeSaved(media) {
+  return formatBytes(mediaTranscodeSavedBytes(media));
+}
+
+function renderBrowserOriginalSize(row) {
+  return row.totals ? formatBytes(browserOriginalSizeBytes(row.totals)) : renderMediaOriginalSize(row.media);
+}
+
+function renderBrowserCurrentSize(row) {
+  return row.totals ? formatBytes(browserCurrentSizeBytes(row.totals)) : renderMediaCurrentSize(row.media);
+}
+
+function renderBrowserCleanupSaved(row) {
+  return row.totals ? formatBytes(browserCleanupSavedBytes(row.totals)) : renderMediaCleanupSaved(row.media);
+}
+
+function renderBrowserTranscodeSaved(row) {
+  return row.totals ? formatBytes(browserTranscodeSavedBytes(row.totals)) : renderMediaTranscodeSaved(row.media);
+}
+
 function renderBrowserTotals(totals) {
   if (!totals) return '';
-  const actual = totals.actualSavedBytes ? formatBytes(totals.actualSavedBytes) : '0 B';
+  const currentSize = browserCurrentSizeBytes(totals);
+  const totalSaved = browserTotalSavedBytes(totals);
+  const cleanupSaved = browserCleanupSavedBytes(totals);
+  const transcodeSaved = browserTranscodeSavedBytes(totals);
+  const originalSize = browserOriginalSizeBytes(totals);
   const estimated = `${formatBytes(totals.estimatedCleanupSavingsBytes || 0)}${totals.estimatedCleanupSavingsComplete ? '' : ' + unknown'}`;
   return `<div class="card-grid browser-card-grid">
     <div class="card"><div class="card-title">Items</div><div class="card-value">${totals.itemCount || 0}</div></div>
-    <div class="card"><div class="card-title">Original Size</div><div class="card-value">${formatBytes(totals.originalSizeBytes || 0)}</div></div>
-    <div class="card"><div class="card-title">Actual Saved</div><div class="card-value">${actual}</div><small>Cleanup ${formatBytes(totals.cleanupSavedBytes || 0)} · Transcode ${formatBytes(totals.transcodeSavedBytes || 0)}</small></div>
+    <div class="card"><div class="card-title">Original Size</div><div class="card-value">${formatBytes(originalSize)}</div><small>Before cleanup/transcode</small></div>
+    <div class="card"><div class="card-title">Current Size</div><div class="card-value">${formatBytes(currentSize)}</div><small>Current files on disk</small></div>
+    <div class="card"><div class="card-title">Actual Saved</div><div class="card-value">${formatBytes(totalSaved)}</div><small>Cleanup ${formatBytes(cleanupSaved)} · Transcode ${formatBytes(transcodeSaved)}</small></div>
     <div class="card"><div class="card-title">Estimated Cleanup Save</div><div class="card-value">${estimated}</div></div>
   </div>`;
 }
+
 
 function ensureMediaBrowserControls() {
     state.mediaBrowser.sort = state.mediaBrowser.sort || localStorage.getItem('mediaBrowserSort') || 'estimatedSaveDesc';
@@ -1184,8 +1275,8 @@ function ensureMediaBrowserControls() {
         <option value="estimatedSaveAsc">Est. save low-high</option>
         <option value="nameAsc">Name A-Z</option>
         <option value="nameDesc">Name Z-A</option>
-        <option value="sizeDesc">Size high-low</option>
-        <option value="sizeAsc">Size low-high</option>
+        <option value="sizeDesc">Current size high-low</option>
+        <option value="sizeAsc">Current size low-high</option>
         <option value="actualSavedDesc">Actual saved high-low</option>
     </select>`;
     row.appendChild(sortLabel);
@@ -1453,8 +1544,10 @@ async function refreshMediaBrowser() {
         { title: 'Name', render: r => r.kind === 'Folder' ? `${escapeHtml(r.name)}` : escapeHtml(r.name) },
         { title: 'Original Lang', render: renderBrowserLanguage },
         { title: 'Items', render: r => r.totals?.itemCount ?? '' },
-        { title: 'Size', render: r => r.totals ? formatBytes(r.totals.originalSizeBytes || 0) : formatBytes(r.media?.fileSizeBytes || 0) },
-        { title: 'Actual Saved', render: r => r.totals ? formatBytes(r.totals.actualSavedBytes || 0) : renderActualSaving(r.media) },
+        { title: 'Original Size', render: renderBrowserOriginalSize },
+        { title: 'Current Size', render: renderBrowserCurrentSize },
+        { title: 'Cleanup Saved', render: renderBrowserCleanupSaved },
+        { title: 'Transcoding Saved', render: renderBrowserTranscodeSaved },
         { title: 'Est. Save', render: r => r.totals ? `${formatBytes(r.totals.estimatedCleanupSavingsBytes || 0)}${r.totals.estimatedCleanupSavingsComplete ? '' : ' + unknown'}` : renderCleanupEstimate(r.media) },
         { title: 'Status', render: r => r.media ? badge(r.media.status) : '' },
         { title: 'Actions', render: renderMediaBrowserActions }
@@ -1472,8 +1565,10 @@ async function refreshMedia() {
     { title: 'ID', key: 'id' },
     { title: 'Status', render: m => badge(m.status) },
     { title: 'Path', key: 'relativePath' },
-    { title: 'Size', render: m => formatBytes(m.fileSizeBytes ?? 0) },
-    { title: 'Actual Saved', render: renderActualSaving },
+    { title: 'Original Size', render: renderMediaOriginalSize },
+    { title: 'Current Size', render: renderMediaCurrentSize },
+    { title: 'Cleanup Saved', render: renderMediaCleanupSaved },
+    { title: 'Transcoding Saved', render: renderMediaTranscodeSaved },
     { title: 'Est. Cleanup Save', render: renderCleanupEstimate },
     { title: 'Probe', render: m => m.hasProbe ? badge('Probed') : badge('NoProbe') },
     { title: 'Plan', render: m => m.hasPlan ? badge('Planned') : badge('NoPlan') },
