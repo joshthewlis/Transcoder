@@ -1,0 +1,53 @@
+/* Media Browser stopgap polish: smaller controls, consistent spacing, clickable folders. */
+#page-media .form-row,
+#page-media .media-browser-toolbar-compact {
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+#page-media .button,
+#media-browser-table .button {
+  padding: 0.28rem 0.55rem;
+  font-size: 0.82rem;
+  line-height: 1.15;
+  border-radius: 0.45rem;
+  white-space: nowrap;
+}
+
+#media-browser-table th,
+#media-browser-table td {
+  padding-top: 0.48rem;
+  padding-bottom: 0.48rem;
+  vertical-align: middle;
+}
+
+#media-browser-table .button-row,
+#media-browser-table td:last-child {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+#media-browser-table .folder-link-button {
+  font-weight: 650;
+  text-align: left;
+  padding: 0;
+  color: var(--accent, #8ec5ff);
+  text-decoration: none;
+}
+
+#media-browser-table .folder-link-button:hover,
+#media-browser-table .folder-link-button:focus-visible {
+  text-decoration: underline;
+}
+
+#media-browser-action-message {
+  margin-left: 0.25rem;
+  min-height: 1.2rem;
+}
+
+.media-browser-sort-control select {
+  min-width: 12rem;
+}
