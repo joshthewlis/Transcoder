@@ -44,12 +44,13 @@ public sealed class TranscodePlanService(
         await metadataRefresh.TryRefreshTrackedMediaAsync(media, policy, force: false, cancellationToken);
 
         var probe = ParseProbe(media.ProbeJson);
+        var transcodeSafety = await settings.GetTranscodeSafetySettingsAsync(cancellationToken);
         var needsVideoProfile = policy.ProcessingStrategy != ProcessingStrategy.CleanupOnly;
         var profileSelection = needsVideoProfile
             ? await SelectVideoProfileAsync(policy, cancellationToken)
             : ProfileSelection.Copy("Cleanup/remux plans copy video and do not require a CPU or GPU encoder.");
 
-        var plan = BuildPlan(media, media.Library, policy, profileSelection, probe);
+        var plan = BuildPlan(media, media.Library, policy, profileSelection, probe, transcodeSafety);
         plan.PlanHash = ComputePlanHash(plan);
 
         media.PlanJson = JsonSerializer.Serialize(plan, JsonOptions);
@@ -872,7 +873,7 @@ public sealed class TranscodePlanService(
         }
     }
 
-    private TranscodePlanDto BuildPlan(MediaItemEntity media, LibraryEntity library, LibraryPolicyDto policy, ProfileSelection profileSelection, ProbeData probe)
+    private TranscodePlanDto BuildPlan(MediaItemEntity media, LibraryEntity library, LibraryPolicyDto policy, ProfileSelection profileSelection, ProbeData probe, TranscodeSafetySettingsDto transcodeSafety)
     {
         var warnings = new List<string>();
         var blocking = new List<string>();
@@ -913,6 +914,17 @@ public sealed class TranscodePlanService(
             var codec = NormalizeCodec(video.CodecName);
             videoNeedsTranscode = policy.Video.OnlyConvertCodecs.Select(NormalizeCodec).Contains(codec, StringComparer.OrdinalIgnoreCase);
             var shouldSkip = policy.Video.SkipCodecs.Select(NormalizeCodec).Contains(codec, StringComparer.OrdinalIgnoreCase);
+            var allowedSourceCodecs = transcodeSafety.AllowedSourceVideoCodecs
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(NormalizeCodec)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .ToList();
+
+            if (!cleanupCandidate && transcodeSafety.ReviewNonAllowedSourceCodecs && allowedSourceCodecs.Count > 0 && !allowedSourceCodecs.Contains(codec, StringComparer.OrdinalIgnoreCase))
+                blocking.Add($"Source video codec '{video.CodecName ?? "unknown"}' is not in the allowed transcode source codec list ({string.Join(", ", allowedSourceCodecs)}). Review required before transcoding.");
+
+            if (!cleanupCandidate && transcodeSafety.ReviewHdrSources && IsHdrVideo(video))
+                blocking.Add("HDR source detected. Review required before transcoding so tone mapping, bit depth, and colour metadata can be checked.");
 
             if (!cleanupCandidate)
             {
@@ -1682,6 +1694,11 @@ public sealed class TranscodePlanService(
                 CodecName = GetString(stream, "codec_name"),
                 CodecLongName = GetString(stream, "codec_long_name"),
                 Profile = GetString(stream, "profile"),
+                PixelFormat = GetString(stream, "pix_fmt"),
+                ColorTransfer = GetString(stream, "color_transfer"),
+                ColorPrimaries = GetString(stream, "color_primaries"),
+                ColorSpace = GetString(stream, "color_space"),
+                SideDataText = ReadSideDataText(stream),
                 Channels = GetInt(stream, "channels"),
                 ChannelLayout = GetString(stream, "channel_layout"),
                 Language = language,
@@ -1693,6 +1710,44 @@ public sealed class TranscodePlanService(
             });
         }
         return result;
+    }
+
+    private static bool IsHdrVideo(ProbeStream stream)
+    {
+        var transfer = (stream.ColorTransfer ?? string.Empty).Trim().ToLowerInvariant();
+        var primaries = (stream.ColorPrimaries ?? string.Empty).Trim().ToLowerInvariant();
+        var space = (stream.ColorSpace ?? string.Empty).Trim().ToLowerInvariant();
+        var pixelFormat = (stream.PixelFormat ?? string.Empty).Trim().ToLowerInvariant();
+        var sideData = (stream.SideDataText ?? string.Empty).Trim().ToLowerInvariant();
+
+        if (transfer is "smpte2084" or "arib-std-b67")
+            return true;
+
+        if (primaries.Contains("bt2020", StringComparison.OrdinalIgnoreCase) || space.Contains("bt2020", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (sideData.Contains("mastering display", StringComparison.OrdinalIgnoreCase) ||
+            sideData.Contains("content light", StringComparison.OrdinalIgnoreCase) ||
+            sideData.Contains("hdr", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return pixelFormat.Contains("10", StringComparison.OrdinalIgnoreCase) &&
+               (primaries.Contains("2020", StringComparison.OrdinalIgnoreCase) || space.Contains("2020", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? ReadSideDataText(JsonElement stream)
+    {
+        if (!stream.TryGetProperty("side_data_list", out var sideData) || sideData.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var values = new List<string>();
+        foreach (var item in sideData.EnumerateArray())
+        {
+            foreach (var property in item.EnumerateObject())
+                values.Add($"{property.Name}={property.Value}");
+        }
+
+        return values.Count == 0 ? null : string.Join(' ', values);
     }
 
     private static string NormalizeCodec(string? codec) => (codec ?? string.Empty).Trim().ToLowerInvariant() switch
@@ -1822,6 +1877,11 @@ public sealed class TranscodePlanService(
         public string? CodecName { get; init; }
         public string? CodecLongName { get; init; }
         public string? Profile { get; init; }
+        public string? PixelFormat { get; init; }
+        public string? ColorTransfer { get; init; }
+        public string? ColorPrimaries { get; init; }
+        public string? ColorSpace { get; init; }
+        public string? SideDataText { get; init; }
         public int? Channels { get; init; }
         public string? ChannelLayout { get; init; }
         public string? Language { get; init; }

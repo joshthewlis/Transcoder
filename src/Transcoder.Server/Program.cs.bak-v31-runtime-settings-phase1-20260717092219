@@ -43,7 +43,6 @@ builder.Services.AddHostedService<LibraryWatcherBackgroundService>();
 builder.Services.AddHostedService<WorkerMonitorService>();
 builder.Services.AddHostedService<AutoReplaceBackgroundService>();
 builder.Services.AddHostedService<AutoQueueBackgroundService>();
-builder.Services.AddHostedService<StorageMapAutoImportService>();
 
 var app = builder.Build();
 

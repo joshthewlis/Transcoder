@@ -150,27 +150,6 @@ public sealed class SystemController(TranscoderDbContext db, SystemSettingsServi
         return await planner.ReconcileAutomaticQueuesAsync(cancellationToken);
     }
 
-
-    [HttpGet("storage-settings")]
-    public async Task<ActionResult<StorageRuntimeSettingsDto>> GetStorageSettings(CancellationToken cancellationToken) => await settings.GetStorageRuntimeSettingsAsync(cancellationToken);
-
-    [HttpPut("storage-settings")]
-    public async Task<ActionResult<StorageRuntimeSettingsDto>> SetStorageSettings(StorageRuntimeSettingsDto request, CancellationToken cancellationToken)
-    {
-        await settings.SetStorageRuntimeSettingsAsync(request, cancellationToken);
-        return await settings.GetStorageRuntimeSettingsAsync(cancellationToken);
-    }
-
-    [HttpGet("transcode-safety")]
-    public async Task<ActionResult<TranscodeSafetySettingsDto>> GetTranscodeSafety(CancellationToken cancellationToken) => await settings.GetTranscodeSafetySettingsAsync(cancellationToken);
-
-    [HttpPut("transcode-safety")]
-    public async Task<ActionResult<TranscodeSafetySettingsDto>> SetTranscodeSafety(TranscodeSafetySettingsDto request, CancellationToken cancellationToken)
-    {
-        await settings.SetTranscodeSafetySettingsAsync(request, cancellationToken);
-        return await settings.GetTranscodeSafetySettingsAsync(cancellationToken);
-    }
-
     [HttpGet("execution")]
     public async Task<ActionResult<ExecutionSettingsDto>> GetExecution(CancellationToken cancellationToken) =>
         await settings.GetExecutionSettingsAsync(cancellationToken);

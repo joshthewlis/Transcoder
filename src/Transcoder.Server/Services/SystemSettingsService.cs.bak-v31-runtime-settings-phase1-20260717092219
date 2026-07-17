@@ -8,10 +8,7 @@ using Transcoder.Server.Options;
 
 namespace Transcoder.Server.Services;
 
-public sealed class SystemSettingsService(
-    TranscoderDbContext db,
-    IOptions<ActiveHoursOptions> activeHoursDefaults,
-    IOptions<StorageOptions> storageDefaults)
+public sealed class SystemSettingsService(TranscoderDbContext db, IOptions<ActiveHoursOptions> activeHoursDefaults, IOptions<StorageOptions> storageDefaults)
 {
     private const string ProcessingModeKey = "processingMode";
     private const string AutoQueueCleanupJobsKey = "autoQueueCleanupJobs";
@@ -22,7 +19,6 @@ public sealed class SystemSettingsService(
     private const string ActiveHoursStartKey = "activeHoursStart";
     private const string ActiveHoursStopKey = "activeHoursStop";
     private const string StopNewWorkMinutesBeforeKey = "stopNewWorkMinutesBefore";
-
     private const string StorageAutoImportStorageMapKey = "storageAutoImportStorageMap";
     private const string StorageAutoImportStorageMapTimeKey = "storageAutoImportStorageMapTime";
     private const string StorageAutoImportStorageMapRetryMinutesKey = "storageAutoImportStorageMapRetryMinutes";
@@ -38,7 +34,7 @@ public sealed class SystemSettingsService(
     public async Task<ProcessingMode> GetProcessingModeAsync(CancellationToken cancellationToken = default)
     {
         var setting = await db.SystemSettings.FirstOrDefaultAsync(x => x.Key == ProcessingModeKey, cancellationToken);
-        return Enum.TryParse(setting?.Value, out ProcessingMode mode) ? mode : ProcessingMode.PlanAndReview;
+        return Enum.TryParse<ProcessingMode>(setting?.Value, out var mode) ? mode : ProcessingMode.PlanAndReview;
     }
 
     public async Task SetProcessingModeAsync(ProcessingMode mode, CancellationToken cancellationToken = default)
@@ -90,7 +86,7 @@ public sealed class SystemSettingsService(
         await db.SaveChangesAsync(cancellationToken);
     }
 
-    public async Task<StorageRuntimeSettingsDto> GetStorageRuntimeSettingsAsync(CancellationToken cancellationToken = default)
+        public async Task<StorageRuntimeSettingsDto> GetStorageRuntimeSettingsAsync(CancellationToken cancellationToken = default)
     {
         var keys = new[]
         {
@@ -162,12 +158,13 @@ public sealed class SystemSettingsService(
         await SetValueAsync(TranscodeSafetyReviewHdrSourcesKey, request.ReviewHdrSources.ToString(), cancellationToken, saveChanges: false);
         await db.SaveChangesAsync(cancellationToken);
     }
-
-    public async Task<WorkerRuntimeSettingsDto> GetWorkerRuntimeSettingsAsync(string workerId, CancellationToken cancellationToken = default)
+public async Task<WorkerRuntimeSettingsDto> GetWorkerRuntimeSettingsAsync(string workerId, CancellationToken cancellationToken = default)
     {
         var key = $"worker:{workerId}:runtimeSettings";
         var setting = await db.SystemSettings.AsNoTracking().FirstOrDefaultAsync(x => x.Key == key, cancellationToken);
-        if (setting is null || string.IsNullOrWhiteSpace(setting.Value)) return new WorkerRuntimeSettingsDto { UpdatedUtc = DateTime.MinValue };
+        if (setting is null || string.IsNullOrWhiteSpace(setting.Value))
+            return new WorkerRuntimeSettingsDto { UpdatedUtc = DateTime.MinValue };
+
         try
         {
             return JsonSerializer.Deserialize<WorkerRuntimeSettingsDto>(setting.Value, new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -203,7 +200,8 @@ public sealed class SystemSettingsService(
             setting.Value = value;
         }
 
-        if (saveChanges) await db.SaveChangesAsync(cancellationToken);
+        if (saveChanges)
+            await db.SaveChangesAsync(cancellationToken);
     }
 
     private static bool ReadBool(IReadOnlyDictionary<string, string> values, string key, bool defaultValue)
@@ -224,18 +222,6 @@ public sealed class SystemSettingsService(
         return value.Trim();
     }
 
-    private static string NormalizeString(string? value, string defaultValue) => string.IsNullOrWhiteSpace(value) ? defaultValue : value.Trim();
-
-    private static string NormalizeCodecList(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return "h264";
-
-        var codecs = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(x => x.Trim().ToLowerInvariant())
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        return codecs.Count == 0 ? "h264" : string.Join(',', codecs);
-    }
+    private static string NormalizeString(string? value, string defaultValue) =>
+        string.IsNullOrWhiteSpace(value) ? defaultValue : value.Trim();
 }

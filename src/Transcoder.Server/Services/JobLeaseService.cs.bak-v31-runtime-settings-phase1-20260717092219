@@ -1,5 +1,3 @@
-using System.Data;
-using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -100,13 +98,6 @@ public sealed class JobLeaseService(
                 .ThenBy(j => j.CreatedUtc)
                 .ToList();
 
-            if (item.JobType is JobType.Cleanup or JobType.Transcode)
-            {
-                var storageSettings = await settings.GetStorageRuntimeSettingsAsync(cancellationToken);
-                if (storageSettings.StorageAwareScheduling)
-                    candidates = await OrderCandidatesByStorageAsync(candidates, storageSettings, cancellationToken);
-            }
-
             foreach (var job in candidates)
             {
                 if (leases.Count(x => x.JobType == item.JobType) >= item.MaxJobs)
@@ -174,117 +165,6 @@ public sealed class JobLeaseService(
         }
 
         return response;
-    }
-
-    private async Task<List<JobEntity>> OrderCandidatesByStorageAsync(List<JobEntity> candidates, StorageRuntimeSettingsDto storageSettings, CancellationToken cancellationToken)
-    {
-        if (candidates.Count <= 1)
-            return candidates;
-
-        await StorageMapImportService.EnsureTableAsync(db, cancellationToken);
-
-        var activeCounts = await ReadActiveStorageCountsAsync(cancellationToken);
-        var keyed = new List<(JobEntity Job, string StorageKey, int ActiveCount, int Priority)>();
-        foreach (var job in candidates)
-        {
-            var storageKey = job.MediaItemId is null
-                ? "unknown"
-                : await ReadStorageKeyForMediaAsync(job.MediaItemId.Value, storageSettings, cancellationToken);
-            var activeCount = activeCounts.TryGetValue(storageKey, out var count) ? count : 0;
-            keyed.Add((job, storageKey, activeCount, JobPriorityHelper.ReadPriorityValue(job.PayloadJson)));
-        }
-
-        var maxPerKey = Math.Max(1, storageSettings.MaxActiveSourceJobsPerStorageKey);
-        var ordered = keyed
-            .OrderBy(x => storageSettings.PreferLeastBusyStorageKey ? x.ActiveCount : 0)
-            .ThenByDescending(x => x.Priority)
-            .ThenBy(x => x.Job.CreatedUtc)
-            .ToList();
-
-        var selected = new List<JobEntity>();
-        foreach (var item in ordered)
-        {
-            var current = activeCounts.TryGetValue(item.StorageKey, out var count) ? count : 0;
-            if (current >= maxPerKey)
-                continue;
-
-            selected.Add(item.Job);
-            activeCounts[item.StorageKey] = current + 1;
-        }
-
-        return selected;
-    }
-
-    private async Task<Dictionary<string, int>> ReadActiveStorageCountsAsync(CancellationToken cancellationToken)
-    {
-        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var connection = db.Database.GetDbConnection();
-        var shouldClose = connection.State != ConnectionState.Open;
-        if (shouldClose) await connection.OpenAsync(cancellationToken);
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText = @"
-select coalesce(nullif(ms.SourceStorageKey,''), 'unknown') as StorageKey, count(*) as ActiveCount
-from Jobs j
-left join MediaStorage ms on ms.MediaItemId = j.MediaItemId and coalesce(ms.SourceStorageStale,0) = 0
-where j.Status in (1,2) and j.JobType in (2,4) and j.MediaItemId is not null
-group by coalesce(nullif(ms.SourceStorageKey,''), 'unknown')";
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                var key = reader.IsDBNull(0) ? "unknown" : reader.GetString(0);
-                var count = reader.IsDBNull(1) ? 0 : Convert.ToInt32(reader.GetValue(1), CultureInfo.InvariantCulture);
-                result[key] = count;
-            }
-        }
-        finally
-        {
-            if (shouldClose) await connection.CloseAsync();
-        }
-
-        return result;
-    }
-
-    private async Task<string> ReadStorageKeyForMediaAsync(long mediaId, StorageRuntimeSettingsDto storageSettings, CancellationToken cancellationToken)
-    {
-        var connection = db.Database.GetDbConnection();
-        var shouldClose = connection.State != ConnectionState.Open;
-        if (shouldClose) await connection.OpenAsync(cancellationToken);
-
-        try
-        {
-            await using var command = connection.CreateCommand();
-            command.CommandText = @"
-select m.RelativePath, ms.SourceStorageKey, coalesce(ms.SourceStorageStale, 1) as SourceStorageStale
-from MediaItems m
-left join MediaStorage ms on ms.MediaItemId = m.Id
-where m.Id = $mediaId";
-            var parameter = command.CreateParameter();
-            parameter.ParameterName = "$mediaId";
-            parameter.Value = mediaId;
-            command.Parameters.Add(parameter);
-
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
-                return "unknown";
-
-            var relativePath = reader.IsDBNull(0) ? null : reader.GetString(0);
-            var storageKey = reader.IsDBNull(1) ? null : reader.GetString(1);
-            var stale = !reader.IsDBNull(2) && Convert.ToInt32(reader.GetValue(2), CultureInfo.InvariantCulture) != 0;
-
-            if (!stale && !string.IsNullOrWhiteSpace(storageKey))
-                return storageKey!;
-
-            return storageSettings.UseParentFolderForUnknownStorageKey
-                ? StorageMapImportService.BuildFallbackStorageKey(relativePath, storageSettings.UnknownStorageKeyFolderDepth)
-                : "unknown";
-        }
-        finally
-        {
-            if (shouldClose) await connection.CloseAsync();
-        }
     }
 
     private JobLeaseBatchResponse BuildBaseResponse(WorkerEntity worker)

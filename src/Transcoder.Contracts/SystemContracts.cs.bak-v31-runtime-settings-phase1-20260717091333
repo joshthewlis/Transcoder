@@ -37,26 +37,6 @@ public sealed class ExecutionSettingsDto
 }
 
 
-
-public sealed class StorageRuntimeSettingsDto
-{
-    public bool AutoImportStorageMap { get; set; }
-    public string AutoImportStorageMapTime { get; set; } = "08:10";
-    public int AutoImportStorageMapRetryMinutes { get; set; } = 30;
-    public bool StorageAwareScheduling { get; set; }
-    public int MaxActiveSourceJobsPerStorageKey { get; set; } = 1;
-    public bool PreferLeastBusyStorageKey { get; set; } = true;
-    public bool UseParentFolderForUnknownStorageKey { get; set; } = true;
-    public int UnknownStorageKeyFolderDepth { get; set; } = 2;
-}
-
-public sealed class TranscodeSafetySettingsDto
-{
-    public string AllowedSourceVideoCodecs { get; set; } = "h264";
-    public bool ReviewNonAllowedSourceCodecs { get; set; } = true;
-    public bool ReviewHdrSources { get; set; } = true;
-}
-
 public sealed class ActiveHoursStatusDto
 {
     public bool Enabled { get; set; }
