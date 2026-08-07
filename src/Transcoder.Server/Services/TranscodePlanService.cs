@@ -53,11 +53,16 @@ public sealed class TranscodePlanService(
         var plan = BuildPlan(media, media.Library, policy, profileSelection, probe, transcodeSafety);
         plan.PlanHash = ComputePlanHash(plan);
 
+        var planCreatedUtc = DateTime.UtcNow;
+        await RecordPlanRevisionAsync(media, plan, planCreatedUtc, cancellationToken);
+
         media.PlanJson = JsonSerializer.Serialize(plan, JsonOptions);
         media.PlanHash = plan.PlanHash;
-        media.PlanCreatedUtc = DateTime.UtcNow;
+        media.PlanCreatedUtc = planCreatedUtc;
+        media.PlanReviewJson = null;
+        media.PlanReviewedUtc = null;
         media.StagingPath = plan.StagingOutputPath;
-        media.UpdatedUtc = DateTime.UtcNow;
+        media.UpdatedUtc = planCreatedUtc;
 
         await ClearExistingPlanningReviewsAsync(media.Id, cancellationToken);
 
@@ -102,9 +107,18 @@ public sealed class TranscodePlanService(
         if (media is null)
             return;
 
+        var reviewedUtc = DateTime.UtcNow;
         media.PlanReviewJson = result.GetRawText();
-        media.PlanReviewedUtc = DateTime.UtcNow;
-        media.UpdatedUtc = DateTime.UtcNow;
+        media.PlanReviewedUtc = reviewedUtc;
+        media.UpdatedUtc = reviewedUtc;
+
+        var currentHistory = await db.MediaPlanHistories
+            .FirstOrDefaultAsync(x => x.MediaItemId == media.Id && x.IsCurrent, cancellationToken);
+        if (currentHistory is not null)
+        {
+            currentHistory.PlanReviewJson = media.PlanReviewJson;
+            currentHistory.PlanReviewedUtc = reviewedUtc;
+        }
 
         var reviewStatus = GetString(result, "reviewStatus") ?? "Rejected";
         if (reviewStatus.Equals("Approved", StringComparison.OrdinalIgnoreCase))
@@ -623,6 +637,104 @@ public sealed class TranscodePlanService(
             Message = alreadyQueued
                 ? $"A {requestedJobType} job is already queued, leased, or running for this media item."
                 : $"{requestedJobType} job queued. Workers will run it when processing mode allows staging work."
+        };
+    }
+
+
+    private async Task RecordPlanRevisionAsync(
+        MediaItemEntity media,
+        TranscodePlanDto newPlan,
+        DateTime createdUtc,
+        CancellationToken cancellationToken)
+    {
+        var existingHistory = await db.MediaPlanHistories
+            .Where(x => x.MediaItemId == media.Id)
+            .OrderBy(x => x.Revision)
+            .ToListAsync(cancellationToken);
+
+        var nextRevision = existingHistory.Count == 0
+            ? 1
+            : existingHistory.Max(x => x.Revision) + 1;
+
+        foreach (var current in existingHistory.Where(x => x.IsCurrent))
+        {
+            current.IsCurrent = false;
+            current.SupersededUtc = createdUtc;
+        }
+
+        // Upgrade/backfill path for databases created before plan history existed.
+        // Preserve the plan currently stored on MediaItems before replacing it.
+        if (existingHistory.Count == 0 && !string.IsNullOrWhiteSpace(media.PlanJson))
+        {
+            TranscodePlanDto? previousPlan = null;
+            try
+            {
+                previousPlan = JsonSerializer.Deserialize<TranscodePlanDto>(media.PlanJson, JsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                logger.LogWarning(ex, "Could not deserialize previous plan while creating plan history for media {MediaId}", media.Id);
+            }
+
+            db.MediaPlanHistories.Add(CreatePlanHistoryEntity(
+                media,
+                previousPlan,
+                media.PlanJson,
+                media.PlanHash,
+                revision: nextRevision,
+                createdUtc: media.PlanCreatedUtc ?? media.UpdatedUtc,
+                isCurrent: false,
+                supersededUtc: createdUtc,
+                planReviewJson: media.PlanReviewJson,
+                planReviewedUtc: media.PlanReviewedUtc));
+
+            nextRevision++;
+        }
+
+        var newPlanJson = JsonSerializer.Serialize(newPlan, JsonOptions);
+        db.MediaPlanHistories.Add(CreatePlanHistoryEntity(
+            media,
+            newPlan,
+            newPlanJson,
+            newPlan.PlanHash,
+            revision: nextRevision,
+            createdUtc: createdUtc,
+            isCurrent: true,
+            supersededUtc: null,
+            planReviewJson: null,
+            planReviewedUtc: null));
+    }
+
+    private static MediaPlanHistoryEntity CreatePlanHistoryEntity(
+        MediaItemEntity media,
+        TranscodePlanDto? plan,
+        string planJson,
+        string? planHash,
+        int revision,
+        DateTime createdUtc,
+        bool isCurrent,
+        DateTime? supersededUtc,
+        string? planReviewJson,
+        DateTime? planReviewedUtc)
+    {
+        return new MediaPlanHistoryEntity
+        {
+            MediaItemId = media.Id,
+            Revision = revision,
+            IsCurrent = isCurrent,
+            PlanJson = planJson,
+            PlanHash = planHash,
+            PlanKind = plan?.PlanKind,
+            ProcessingStrategy = plan?.ProcessingStrategy.ToString(),
+            InputFileSizeBytes = plan?.InputFileSizeBytes ?? media.FileSizeBytes,
+            EstimatedRemovedBytes = plan?.EstimatedRemovedBytes,
+            EstimatedOutputSizeBytes = plan?.EstimatedOutputSizeBytes,
+            EstimatedSavingsComplete = plan?.EstimatedSavingsComplete ?? false,
+            CleanupRequired = plan?.CleanupRequired ?? false,
+            PlanReviewJson = planReviewJson,
+            PlanCreatedUtc = createdUtc,
+            PlanReviewedUtc = planReviewedUtc,
+            SupersededUtc = supersededUtc
         };
     }
 

@@ -7,6 +7,7 @@ public sealed class TranscoderDbContext(DbContextOptions<TranscoderDbContext> op
 {
     public DbSet<LibraryEntity> Libraries => Set<LibraryEntity>();
     public DbSet<MediaItemEntity> MediaItems => Set<MediaItemEntity>();
+    public DbSet<MediaPlanHistoryEntity> MediaPlanHistories => Set<MediaPlanHistoryEntity>();
     public DbSet<WorkerEntity> Workers => Set<WorkerEntity>();
     public DbSet<WorkerPathCheckEntity> WorkerPathChecks => Set<WorkerPathCheckEntity>();
     public DbSet<JobEntity> Jobs => Set<JobEntity>();
@@ -19,6 +20,13 @@ public sealed class TranscoderDbContext(DbContextOptions<TranscoderDbContext> op
     {
         modelBuilder.Entity<LibraryEntity>().HasIndex(x => x.RootPath).IsUnique();
         modelBuilder.Entity<MediaItemEntity>().HasIndex(x => new { x.LibraryId, x.RelativePath }).IsUnique();
+        modelBuilder.Entity<MediaPlanHistoryEntity>().HasIndex(x => new { x.MediaItemId, x.Revision }).IsUnique();
+        modelBuilder.Entity<MediaPlanHistoryEntity>().HasIndex(x => new { x.MediaItemId, x.IsCurrent });
+        modelBuilder.Entity<MediaPlanHistoryEntity>()
+            .HasOne(x => x.MediaItem)
+            .WithMany()
+            .HasForeignKey(x => x.MediaItemId)
+            .OnDelete(DeleteBehavior.Cascade);
         modelBuilder.Entity<WorkerEntity>().HasIndex(x => x.WorkerId).IsUnique();
         modelBuilder.Entity<WorkerPathCheckEntity>().HasIndex(x => new { x.WorkerId, x.CheckId, x.MappingConfigHash });
         modelBuilder.Entity<JobEntity>().HasIndex(x => new { x.Status, x.JobType, x.CreatedUtc });

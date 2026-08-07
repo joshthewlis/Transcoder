@@ -51,6 +51,37 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<TranscoderDbContext>();
     db.Database.EnsureCreated();
+
+    // EnsureCreated() does not add new tables to an existing SQLite database.
+    // Keep this lightweight compatibility upgrade until the project moves to EF migrations.
+    db.Database.ExecuteSqlRaw(@"
+        CREATE TABLE IF NOT EXISTS MediaPlanHistories (
+            Id INTEGER NOT NULL CONSTRAINT PK_MediaPlanHistories PRIMARY KEY AUTOINCREMENT,
+            MediaItemId INTEGER NOT NULL,
+            Revision INTEGER NOT NULL,
+            IsCurrent INTEGER NOT NULL,
+            PlanJson TEXT NOT NULL,
+            PlanHash TEXT NULL,
+            PlanKind TEXT NULL,
+            ProcessingStrategy TEXT NULL,
+            InputFileSizeBytes INTEGER NOT NULL,
+            EstimatedRemovedBytes INTEGER NULL,
+            EstimatedOutputSizeBytes INTEGER NULL,
+            EstimatedSavingsComplete INTEGER NOT NULL,
+            CleanupRequired INTEGER NOT NULL,
+            PlanReviewJson TEXT NULL,
+            PlanCreatedUtc TEXT NOT NULL,
+            PlanReviewedUtc TEXT NULL,
+            SupersededUtc TEXT NULL,
+            CONSTRAINT FK_MediaPlanHistories_MediaItems_MediaItemId
+                FOREIGN KEY (MediaItemId) REFERENCES MediaItems (Id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS IX_MediaPlanHistories_MediaItemId_Revision
+            ON MediaPlanHistories (MediaItemId, Revision);
+        CREATE INDEX IF NOT EXISTS IX_MediaPlanHistories_MediaItemId_IsCurrent
+            ON MediaPlanHistories (MediaItemId, IsCurrent);
+    " );
+
     ProfileSeeder.SeedDefaultsAsync(db).GetAwaiter().GetResult();
     scope.ServiceProvider.GetRequiredService<StorageInitializer>().EnsureStorageFolders();
 }
