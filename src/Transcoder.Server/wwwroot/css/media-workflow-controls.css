@@ -1,0 +1,8 @@
+.workflow-review-tools {
+  margin: 0.75rem 0;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+#workflow-action-message {
+  margin-left: 0.5rem;
+}

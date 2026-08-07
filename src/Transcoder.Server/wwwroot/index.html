@@ -1,395 +1,392 @@
 <!doctype html>
 <html lang="en">
 <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Transcoder</title>
-    <link rel="stylesheet" href="/css/app.css?v=31" />
-    <link rel="stylesheet" href="/css/media-browser-stopgap.css?v=31.7" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Transcoder</title>
+  <link rel="stylesheet" href="/css/app.css?v=31" />
+  <link rel="stylesheet" href="/css/media-workflow-controls.css?v=32.1" />
 </head>
 <body>
-    <div class="app-shell">
-        <header class="topbar">
-            <div class="brand">
-                <div class="brand-mark">T</div>
-                <div>
-                    <div class="brand-title">Transcoder</div>
-                    <div class="brand-subtitle" id="server-version">Server</div>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">T</div>
+        <div>
+          <div class="brand-title">Transcoder</div>
+          <div class="brand-subtitle" id="server-version">Server</div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="connection-pill" id="connection-state">Polling</span>
+        <a class="swagger-link" href="/swagger">Swagger</a>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <aside class="sidebar">
+        <nav class="nav-list">
+          <a href="#dashboard" class="nav-link active" data-page="dashboard">Dashboard</a>
+          <a href="#libraries" class="nav-link" data-page="libraries">Libraries</a>
+          <a href="#jobs" class="nav-link" data-page="jobs">Jobs</a>
+          <a href="#media" class="nav-link" data-page="media">Media</a>
+          <a href="#review" class="nav-link" data-page="review">Review</a>
+          <a href="#workers" class="nav-link" data-page="workers">Workers</a>
+          <a href="#integrations" class="nav-link" data-page="integrations">Integrations</a>
+          <a href="#settings" class="nav-link" data-page="settings">Settings</a>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <section class="page active" id="page-dashboard">
+          <div class="page-header">
+            <h1>Dashboard</h1>
+            <p>Current server, queue, and worker state.</p>
+          </div>
+          <div class="card-grid" id="status-cards"></div>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Active Jobs</h2>
+              <button class="button" data-refresh="jobs">Refresh</button>
+            </div>
+            <div class="table-wrap"><table id="dashboard-active-jobs-table"></table></div>
+          </section>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Finished Jobs</h2>
+              <button class="button" data-refresh="jobs">Refresh</button>
+            </div>
+            <div class="table-wrap"><table id="dashboard-finished-jobs-table"></table></div>
+          </section>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Library Overview</h2>
+              <button class="button" data-refresh="libraries">Refresh</button>
+            </div>
+            <div id="dashboard-library-overview" class="library-overview-grid"></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-workers">
+          <div class="page-header">
+            <h1>Workers</h1>
+            <p>Registered workers, path access, local scratch, and control state.</p>
+          </div>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Workers</h2>
+              <button class="button" data-refresh="workers">Refresh</button>
+            </div>
+            <div class="table-wrap"><table id="workers-table"></table></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-libraries">
+          <div class="page-header">
+            <h1>Libraries</h1>
+            <p>Create libraries, scan folders, and set the first conversion policy.</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Add Library</h2>
+              <span class="muted">Cleanup or transcode policy</span>
+            </div>
+            <form id="create-library-form" class="policy-form">
+              <fieldset class="policy-section">
+                <legend>Library</legend>
+                <div class="form-grid">
+                  <label><span>Name</span><input id="library-name" type="text" placeholder="Movies" required /></label>
+                  <label><span>Root Path</span><input id="library-root" type="text" placeholder="C:\TransTest\Movies" required /></label>
+                  <label><span>Processing Strategy</span><select id="library-processing-strategy"><option value="CleanupOnly">CleanupOnly - remove/reorder streams only</option><option value="TranscodeOnly">TranscodeOnly - convert video and map kept streams</option><option value="CleanupThenTranscode">CleanupThenTranscode - cleanup first, transcode later</option></select></label>
+                  <div class="checkbox-stack">
+                    <label><input id="library-enabled" type="checkbox" checked /> Enabled</label>
+                    <label><input id="library-scan-after-create" type="checkbox" checked /> Scan after create</label>
+                    <label><input id="library-generate-cleanup-jobs" type="checkbox" checked /> Generate cleanup jobs</label>
+                    <label><input id="library-generate-transcode-jobs" type="checkbox" /> Generate transcode jobs</label>
+                  </div>
                 </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Video</legend>
+                <p class="section-help">Used for real transcode plans. Cleanup/remux plans copy video as-is.</p>
+                <div class="form-grid">
+                  <label><span>Target Video Codec</span><select id="library-target-codec"><option value="hevc">H.265 / HEVC</option><option value="av1">AV1</option></select></label>
+                  <label><span>Video Profile</span><select id="library-video-profile"><option value="hevc_nvenc_balanced">hevc_nvenc_balanced</option><option value="hevc_qsv_balanced">hevc_qsv_balanced</option><option value="hevc_vaapi_balanced">hevc_vaapi_balanced</option><option value="hevc_amf_balanced">hevc_amf_balanced</option><option value="libx265_quality">libx265_quality</option><option value="av1_qsv_balanced">av1_qsv_balanced</option><option value="av1_nvenc_balanced">av1_nvenc_balanced</option><option value="libsvtav1_quality">libsvtav1_quality</option><option value="copy_video_cleanup_streams">copy_video_cleanup_streams</option></select></label>
+                  <label><span>Transcode Engine</span><select id="library-transcode-engine"><option value="PreferGpu">Prefer GPU</option><option value="GpuOnly">GPU only</option><option value="PreferCpu">Prefer CPU</option><option value="CpuOnly">CPU only</option><option value="Either">Either</option></select></label>
+                  <label><span>Convert Codecs</span><input id="library-convert-codecs" type="text" value="h264" /></label>
+                  <label><span>Skip Codecs</span><input id="library-skip-codecs" type="text" value="hevc,av1" /></label>
+                </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Audio</legend>
+                <p class="section-help">Cleanup/remux keeps selected audio as-is. Premium mode decides whether duplicate TrueHD/DTS/Atmos-style tracks are kept or removed.</p>
+                <div class="form-grid">
+                  <label><span>Keep Audio Languages</span><input id="library-audio-languages" type="text" value="eng" /></label>
+                  <label><span>Audio Target</span><select id="library-audio-target"><option value="copy">copy</option><option value="eac3">eac3</option><option value="aac">aac</option></select></label>
+                  <label><span>Audio Duplicate Mode</span><select id="library-audio-duplicate-mode"><option value="KeepBestPerLanguage">Keep best per language</option><option value="KeepBestAndStereoPerLanguage">Keep best + stereo fallback</option><option value="KeepAllAllowed">Keep all allowed</option></select></label>
+                  <label><span>Premium Audio Mode</span><select id="library-premium-audio-mode"><option value="KeepBestPremiumAndCompatibility">Best premium + compatibility</option><option value="KeepBestPremiumOnly">Best premium only</option><option value="KeepBestTwoPremiumAndCompatibility">Best two premium + compatibility</option><option value="KeepAllPremium">Keep all premium</option><option value="KeepCompatibilityOnly">Compatibility only</option></select></label>
+                  <label><span>Premium Ranking</span><select id="library-premium-audio-ranking"><option value="PreferAtmosThenTrueHd">Atmos then TrueHD</option><option value="PreferAtmosThenDts">Atmos then DTS</option><option value="PreferTrueHd">Prefer TrueHD</option><option value="PreferDts">Prefer DTS</option></select></label>
+                  <label><span>Preferred Audio Channels</span><input id="library-preferred-audio-channels" type="number" min="1" max="32" value="6" /></label>
+                  <label><span>Maximum Audio Channels</span><input id="library-maximum-audio-channels" type="number" min="0" max="32" value="8" /></label>
+                  <label><span>Unknown Audio</span><select id="library-unknown-audio"><option value="NeedsReview">NeedsReview</option><option value="Keep">Keep</option><option value="Remove">Remove</option></select></label>
+                  <div class="checkbox-stack">
+                    <label><input id="library-keep-original-language" type="checkbox" checked /> Keep original</label>
+                    <label><input id="library-original-language-first" type="checkbox" checked /> Original first</label>
+                    <label><input id="library-preserve-spatial-audio" type="checkbox" checked /> Spatial premium</label>
+                    <label><input id="library-preserve-lossless-audio" type="checkbox" checked /> Lossless premium</label>
+                    <label><input id="library-keep-compatibility-track" type="checkbox" checked /> Keep compat track</label>
+                    <label><input id="library-review-different-mix-titles" type="checkbox" checked /> Review mix titles</label>
+                    <label><input id="library-remove-descriptive-audio" type="checkbox" checked /> Remove descriptive</label>
+                  </div>
+                </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Subtitles</legend>
+                <div class="form-grid">
+                  <label><span>Keep Subtitle Languages</span><input id="library-subtitle-languages" type="text" value="eng" /></label>
+                  <label><span>Unknown Subtitles</span><select id="library-unknown-subtitles"><option value="NeedsReview">NeedsReview</option><option value="Keep">Keep</option><option value="Remove">Remove</option></select></label>
+                  <div class="checkbox-stack"><label><input id="library-keep-forced" type="checkbox" checked /> Keep forced subtitles</label></div>
+                </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Metadata</legend>
+                <div class="form-grid">
+                  <label><span>Metadata Priority</span><input id="library-metadata-priority" type="text" value="Radarr,Sonarr,Tmdb,FileProbe" /></label>
+                  <label><span>Radarr Integration</span><select id="library-radarr-integration-id"><option value="">None</option></select></label>
+                  <label><span>Sonarr Integration</span><select id="library-sonarr-integration-id"><option value="">None</option></select></label>
+                  <label><span>Default Original Language</span><input id="library-default-original-language" type="text" placeholder="Optional fallback only, e.g. eng or jpn" /></label>
+                </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Output / Replace</legend>
+                <p class="section-help">Staging is always used first. Replace moves the original to quarantine and puts the staged file back at the same filename.</p>
+                <div class="checkbox-stack">
+                  <label><input id="library-replace-originals" type="checkbox" /> Allow replace originals</label>
+                </div>
+              </fieldset>
+
+              <fieldset class="policy-section">
+                <legend>Watch / Scan</legend>
+                <div class="form-grid">
+                  <label><span>Watch Settle Seconds</span><input id="library-watch-settle" type="number" min="10" value="300" /></label>
+                  <label><span>Periodic Rescan Minutes</span><input id="library-periodic-rescan" type="number" min="0" value="120" /></label>
+                  <div class="checkbox-stack"><label><input id="library-watch-enabled" type="checkbox" checked /> Watch files</label><label><input id="library-scan-on-startup" type="checkbox" /> Startup scan</label></div>
+                </div>
+              </fieldset>
+
+              <div class="form-actions">
+                <button type="submit" class="button primary">Create Library</button>
+                <button type="button" class="button" id="reset-library-form">Reset</button>
+                <span id="library-form-message" class="form-message"></span>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Libraries</h2>
+              <button class="button" data-refresh="libraries">Refresh</button>
             </div>
-            <div class="topbar-actions">
-                <span class="connection-pill" id="connection-state">Polling</span>
-                <a class="swagger-link" href="/swagger">Swagger</a>
+            <div class="table-wrap"><table id="libraries-table"></table></div>
+          </section>
+        </section>
+
+        <section class="page" id="page-jobs">
+          <div class="page-header">
+            <h1>Jobs</h1>
+            <p>Queued, leased, running, completed, and failed jobs.</p>
+          </div>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Jobs</h2>
+              <div class="button-row">
+                <button class="button" id="clear-finished-jobs">Clear Finished</button>
+                <button class="button" data-refresh="jobs">Refresh</button>
+              </div>
             </div>
-        </header>
+            <div class="filter-bar">
+              <label><span>Type</span><select id="job-filter-type"><option value="">All</option><option>Probe</option><option>PlanReview</option><option>Cleanup</option><option>Transcode</option><option>ValidateOutput</option></select></label>
+              <label><span>Status</span><select id="job-filter-status"><option value="">All</option><option>Queued</option><option>Leased</option><option>Running</option><option>Completed</option><option>Failed</option><option>Cancelled</option><option>Expired</option></select></label>
+              <label><span>Worker</span><input id="job-filter-worker" type="text" placeholder="worker id contains" /></label>
+              <label class="inline-check"><input id="job-filter-active-only" type="checkbox" /> Active only</label>
+              <button class="button" id="apply-job-filters">Apply</button>
+              <button class="button" id="reset-job-filters">Reset</button>
+            </div>
+            <div class="table-wrap"><table id="jobs-table"></table></div>
+            <div class="pager" data-pager="jobs"><button class="button" data-page-action="prev" data-page-target="jobs">Prev</button><span id="jobs-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="jobs">Next</button><label>Page size <select id="jobs-page-size" data-page-size="jobs"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
+          </section>
+        </section>
 
-        <div class="main-layout">
-            <aside class="sidebar">
-                <nav class="nav-list">
-                    <a href="#dashboard" class="nav-link active" data-page="dashboard">Dashboard</a>
-                    <a href="#libraries" class="nav-link" data-page="libraries">Libraries</a>
-                    <a href="#jobs" class="nav-link" data-page="jobs">Jobs</a>
-                    <a href="#media" class="nav-link" data-page="media">Media</a>
-                    <a href="#review" class="nav-link" data-page="review">Review</a>
-                    <a href="#workers" class="nav-link" data-page="workers">Workers</a>
-                    <a href="#integrations" class="nav-link" data-page="integrations">Integrations</a>
-                    <a href="#settings" class="nav-link" data-page="settings">Settings</a>
-                </nav>
-            </aside>
+        <section class="page" id="page-media">
+          <div class="page-header">
+            <h1>Media</h1>
+            <p>Scanned media items and probe state.</p>
+          </div>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Media Browser</h2>
+              <button class="button" data-refresh="media">Refresh</button>
+            </div>
+            <div class="form-row">
+              <label><span>Library</span><select id="media-browser-library"></select></label>
+              <button class="button" id="media-browser-up">Up</button>
+            </div>
+            <div id="media-browser-breadcrumbs" class="breadcrumbs"></div>
+            <div id="media-browser-totals" class="browser-totals"></div>
+            <div class="table-wrap"><table id="media-browser-table"></table></div>
+          </section>
 
-            <main class="content">
-                <section class="page active" id="page-dashboard">
-                    <div class="page-header">
-                        <h1>Dashboard</h1>
-                        <p>Current server, queue, and worker state.</p>
-                    </div>
-                    <div class="card-grid" id="status-cards"></div>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Active Jobs</h2>
-                            <button class="button" data-refresh="jobs">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="dashboard-active-jobs-table"></table></div>
-                    </section>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Finished Jobs</h2>
-                            <button class="button" data-refresh="jobs">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="dashboard-finished-jobs-table"></table></div>
-                    </section>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Library Overview</h2>
-                            <button class="button" data-refresh="libraries">Refresh</button>
-                        </div>
-                        <div id="dashboard-library-overview" class="library-overview-grid"></div>
-                    </section>
-                </section>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Media List</h2>
+              <button class="button" data-refresh="media">Refresh</button>
+            </div>
+            <div class="table-wrap"><table id="media-table"></table></div>
+            <div class="pager" data-pager="media"><button class="button" data-page-action="prev" data-page-target="media">Prev</button><span id="media-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="media">Next</button><label>Page size <select id="media-page-size" data-page-size="media"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
+          </section>
 
-                <section class="page" id="page-workers">
-                    <div class="page-header">
-                        <h1>Workers</h1>
-                        <p>Registered workers, path access, local scratch, and control state.</p>
-                    </div>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Workers</h2>
-                            <button class="button" data-refresh="workers">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="workers-table"></table></div>
-                    </section>
-                </section>
+        </section>
 
-                <section class="page" id="page-libraries">
-                    <div class="page-header">
-                        <h1>Libraries</h1>
-                        <p>Create libraries, scan folders, and set the first conversion policy.</p>
-                    </div>
-
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Add Library</h2>
-                            <span class="muted">Cleanup or transcode policy</span>
-                        </div>
-                        <form id="create-library-form" class="policy-form">
-                            <fieldset class="policy-section">
-                                <legend>Library</legend>
-                                <div class="form-grid">
-                                    <label><span>Name</span><input id="library-name" type="text" placeholder="Movies" required /></label>
-                                    <label><span>Root Path</span><input id="library-root" type="text" placeholder="C:\TransTest\Movies" required /></label>
-                                    <label><span>Processing Strategy</span><select id="library-processing-strategy"><option value="CleanupOnly">CleanupOnly - remove/reorder streams only</option><option value="TranscodeOnly">TranscodeOnly - convert video and map kept streams</option><option value="CleanupThenTranscode">CleanupThenTranscode - cleanup first, transcode later</option></select></label>
-                                    <div class="checkbox-stack">
-                                        <label><input id="library-enabled" type="checkbox" checked /> Enabled</label>
-                                        <label><input id="library-scan-after-create" type="checkbox" checked /> Scan after create</label>
-                                        <label><input id="library-generate-cleanup-jobs" type="checkbox" checked /> Generate cleanup jobs</label>
-                                        <label><input id="library-generate-transcode-jobs" type="checkbox" /> Generate transcode jobs</label>
-                                    </div>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Video</legend>
-                                <p class="section-help">Used for real transcode plans. Cleanup/remux plans copy video as-is.</p>
-                                <div class="form-grid">
-                                    <label><span>Target Video Codec</span><select id="library-target-codec"><option value="hevc">H.265 / HEVC</option><option value="av1">AV1</option></select></label>
-                                    <label><span>Video Profile</span><select id="library-video-profile"><option value="hevc_nvenc_balanced">hevc_nvenc_balanced</option><option value="hevc_qsv_balanced">hevc_qsv_balanced</option><option value="hevc_vaapi_balanced">hevc_vaapi_balanced</option><option value="hevc_amf_balanced">hevc_amf_balanced</option><option value="libx265_quality">libx265_quality</option><option value="av1_qsv_balanced">av1_qsv_balanced</option><option value="av1_nvenc_balanced">av1_nvenc_balanced</option><option value="libsvtav1_quality">libsvtav1_quality</option><option value="copy_video_cleanup_streams">copy_video_cleanup_streams</option></select></label>
-                                    <label><span>Transcode Engine</span><select id="library-transcode-engine"><option value="PreferGpu">Prefer GPU</option><option value="GpuOnly">GPU only</option><option value="PreferCpu">Prefer CPU</option><option value="CpuOnly">CPU only</option><option value="Either">Either</option></select></label>
-                                    <label><span>Convert Codecs</span><input id="library-convert-codecs" type="text" value="h264" /></label>
-                                    <label><span>Skip Codecs</span><input id="library-skip-codecs" type="text" value="hevc,av1" /></label>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Audio</legend>
-                                <p class="section-help">Cleanup/remux keeps selected audio as-is. Premium mode decides whether duplicate TrueHD/DTS/Atmos-style tracks are kept or removed.</p>
-                                <div class="form-grid">
-                                    <label><span>Keep Audio Languages</span><input id="library-audio-languages" type="text" value="eng" /></label>
-                                    <label><span>Audio Target</span><select id="library-audio-target"><option value="copy">copy</option><option value="eac3">eac3</option><option value="aac">aac</option></select></label>
-                                    <label><span>Audio Duplicate Mode</span><select id="library-audio-duplicate-mode"><option value="KeepBestPerLanguage">Keep best per language</option><option value="KeepBestAndStereoPerLanguage">Keep best + stereo fallback</option><option value="KeepAllAllowed">Keep all allowed</option></select></label>
-                                    <label><span>Premium Audio Mode</span><select id="library-premium-audio-mode"><option value="KeepBestPremiumAndCompatibility">Best premium + compatibility</option><option value="KeepBestPremiumOnly">Best premium only</option><option value="KeepBestTwoPremiumAndCompatibility">Best two premium + compatibility</option><option value="KeepAllPremium">Keep all premium</option><option value="KeepCompatibilityOnly">Compatibility only</option></select></label>
-                                    <label><span>Premium Ranking</span><select id="library-premium-audio-ranking"><option value="PreferAtmosThenTrueHd">Atmos then TrueHD</option><option value="PreferAtmosThenDts">Atmos then DTS</option><option value="PreferTrueHd">Prefer TrueHD</option><option value="PreferDts">Prefer DTS</option></select></label>
-                                    <label><span>Preferred Audio Channels</span><input id="library-preferred-audio-channels" type="number" min="1" max="32" value="6" /></label>
-                                    <label><span>Maximum Audio Channels</span><input id="library-maximum-audio-channels" type="number" min="0" max="32" value="8" /></label>
-                                    <label><span>Unknown Audio</span><select id="library-unknown-audio"><option value="NeedsReview">NeedsReview</option><option value="Keep">Keep</option><option value="Remove">Remove</option></select></label>
-                                    <div class="checkbox-stack">
-                                        <label><input id="library-keep-original-language" type="checkbox" checked /> Keep original</label>
-                                        <label><input id="library-original-language-first" type="checkbox" checked /> Original first</label>
-                                        <label><input id="library-preserve-spatial-audio" type="checkbox" checked /> Spatial premium</label>
-                                        <label><input id="library-preserve-lossless-audio" type="checkbox" checked /> Lossless premium</label>
-                                        <label><input id="library-keep-compatibility-track" type="checkbox" checked /> Keep compat track</label>
-                                        <label><input id="library-review-different-mix-titles" type="checkbox" checked /> Review mix titles</label>
-                                        <label><input id="library-remove-descriptive-audio" type="checkbox" checked /> Remove descriptive</label>
-                                    </div>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Subtitles</legend>
-                                <div class="form-grid">
-                                    <label><span>Keep Subtitle Languages</span><input id="library-subtitle-languages" type="text" value="eng" /></label>
-                                    <label><span>Unknown Subtitles</span><select id="library-unknown-subtitles"><option value="NeedsReview">NeedsReview</option><option value="Keep">Keep</option><option value="Remove">Remove</option></select></label>
-                                    <div class="checkbox-stack"><label><input id="library-keep-forced" type="checkbox" checked /> Keep forced subtitles</label></div>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Metadata</legend>
-                                <div class="form-grid">
-                                    <label><span>Metadata Priority</span><input id="library-metadata-priority" type="text" value="Radarr,Sonarr,Tmdb,FileProbe" /></label>
-                                    <label><span>Radarr Integration</span><select id="library-radarr-integration-id"><option value="">None</option></select></label>
-                                    <label><span>Sonarr Integration</span><select id="library-sonarr-integration-id"><option value="">None</option></select></label>
-                                    <label><span>Default Original Language</span><input id="library-default-original-language" type="text" placeholder="Optional fallback only, e.g. eng or jpn" /></label>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Output / Replace</legend>
-                                <p class="section-help">Staging is always used first. Replace moves the original to quarantine and puts the staged file back at the same filename.</p>
-                                <div class="checkbox-stack">
-                                    <label><input id="library-replace-originals" type="checkbox" /> Allow replace originals</label>
-                                </div>
-                            </fieldset>
-
-                            <fieldset class="policy-section">
-                                <legend>Watch / Scan</legend>
-                                <div class="form-grid">
-                                    <label><span>Watch Settle Seconds</span><input id="library-watch-settle" type="number" min="10" value="300" /></label>
-                                    <label><span>Periodic Rescan Minutes</span><input id="library-periodic-rescan" type="number" min="0" value="120" /></label>
-                                    <div class="checkbox-stack"><label><input id="library-watch-enabled" type="checkbox" checked /> Watch files</label><label><input id="library-scan-on-startup" type="checkbox" /> Startup scan</label></div>
-                                </div>
-                            </fieldset>
-
-                            <div class="form-actions">
-                                <button type="submit" class="button primary">Create Library</button>
-                                <button type="button" class="button" id="reset-library-form">Reset</button>
-                                <span id="library-form-message" class="form-message"></span>
-                            </div>
-                        </form>
-                    </section>
-
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Libraries</h2>
-                            <button class="button" data-refresh="libraries">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="libraries-table"></table></div>
-                    </section>
-                </section>
-
-                <section class="page" id="page-jobs">
-                    <div class="page-header">
-                        <h1>Jobs</h1>
-                        <p>Queued, leased, running, completed, and failed jobs.</p>
-                    </div>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Jobs</h2>
-                            <div class="button-row">
-                                <button class="button" id="clear-finished-jobs">Clear Finished</button>
-                                <button class="button" data-refresh="jobs">Refresh</button>
-                            </div>
-                        </div>
-                        <div class="filter-bar">
-                            <label><span>Type</span><select id="job-filter-type"><option value="">All</option><option>Probe</option><option>PlanReview</option><option>Cleanup</option><option>Transcode</option><option>ValidateOutput</option></select></label>
-                            <label><span>Status</span><select id="job-filter-status"><option value="">All</option><option>Queued</option><option>Leased</option><option>Running</option><option>Completed</option><option>Failed</option><option>Cancelled</option><option>Expired</option></select></label>
-                            <label><span>Worker</span><input id="job-filter-worker" type="text" placeholder="worker id contains" /></label>
-                            <label class="inline-check"><input id="job-filter-active-only" type="checkbox" /> Active only</label>
-                            <button class="button" id="apply-job-filters">Apply</button>
-                            <button class="button" id="reset-job-filters">Reset</button>
-                        </div>
-                        <div class="table-wrap"><table id="jobs-table"></table></div>
-                        <div class="pager" data-pager="jobs"><button class="button" data-page-action="prev" data-page-target="jobs">Prev</button><span id="jobs-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="jobs">Next</button><label>Page size <select id="jobs-page-size" data-page-size="jobs"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
-                    </section>
-                </section>
-
-                <section class="page" id="page-media">
-                    <div class="page-header">
-                        <h1>Media</h1>
-                        <p>Scanned media items and probe state.</p>
-                    </div>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Media Browser</h2>
-                            <button class="button" data-refresh="media">Refresh</button>
-                        </div>
-                        <div class="form-row">
-                            <label><span>Library</span><select id="media-browser-library"></select></label>
-                            <button class="button" id="media-browser-up">Up</button>
-                        </div>
-                        <div id="media-browser-breadcrumbs" class="breadcrumbs"></div>
-                        <div id="media-browser-totals" class="browser-totals"></div>
-                        <div class="table-wrap"><table id="media-browser-table"></table></div>
-                    </section>
-
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Media List</h2>
-                            <button class="button" data-refresh="media">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="media-table"></table></div>
-                        <div class="pager" data-pager="media"><button class="button" data-page-action="prev" data-page-target="media">Prev</button><span id="media-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="media">Next</button><label>Page size <select id="media-page-size" data-page-size="media"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
-                    </section>
-
-                </section>
-
-                <section class="page" id="page-review">
-                    <div class="page-header">
-                        <h1>Review</h1>
-                        <p>Human intervention queue for unknown metadata, failed plan review, and validation warnings.</p>
-                    </div>
-                    <section class="panel">
-                        <div class="panel-header">
-                            <h2>Needs Review</h2>
-                            <button class="button" data-refresh="review">Refresh</button>
-                        </div>
-                        <div class="table-wrap"><table id="review-table"></table></div>
-                        <div class="pager" data-pager="review"><button class="button" data-page-action="prev" data-page-target="review">Prev</button><span id="review-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="review">Next</button><label>Page size <select id="review-page-size" data-page-size="review"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
-                    </section>
-                </section>
+        <section class="page" id="page-review">
+          <div class="page-header">
+            <h1>Review</h1>
+            <p>Human intervention queue for unknown metadata, failed plan review, and validation warnings.</p>
+          </div>
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Needs Review</h2>
+              <button class="button" data-refresh="review">Refresh</button>
+            </div>
+            <div class="table-wrap"><table id="review-table"></table></div>
+            <div class="pager" data-pager="review"><button class="button" data-page-action="prev" data-page-target="review">Prev</button><span id="review-page-info" class="pager-info">Page 1</span><button class="button" data-page-action="next" data-page-target="review">Next</button><label>Page size <select id="review-page-size" data-page-size="review"><option>25</option><option selected>50</option><option>100</option><option>250</option><option>500</option></select></label></div>
+          </section>
+        </section>
 
                 <section class="page" id="page-integrations">
-                    <div class="page-header">
-                        <h1>Integrations</h1>
-                        <p>Configure Radarr, Sonarr, TMDb, and path mappings used for metadata lookup.</p>
-                    </div>
-                    <section class="panel settings-panel">
-                        <div class="panel-header">
-                            <h2>Integrations</h2>
-                            <button class="button" data-refresh="integrations">Refresh</button>
-                        </div>
-                        <form id="create-integration-form" class="form-grid">
-                            <label>
-                                <span>Name</span>
-                                <input id="integration-name" type="text" placeholder="Radarr" />
-                            </label>
-                            <label>
-                                <span>Type</span>
-                                <select id="integration-type">
-                                    <option>Radarr</option>
-                                    <option>Sonarr</option>
-                                    <option>Tmdb</option>
-                                    <option>Imdb</option>
-                                </select>
-                            </label>
-                            <label>
-                                <span>Base URL</span>
-                                <input id="integration-base-url" type="text" placeholder="http://radarr:7878 or https://api.themoviedb.org" />
-                            </label>
-                            <label>
-                                <span>API Key / Token</span>
-                                <input id="integration-api-key" type="password" placeholder="Stored by server" />
-                            </label>
-                            <label>
-                                <span>Integration Path</span>
-                                <input id="integration-path" type="text" placeholder="/movies or /tv" />
-                            </label>
-                            <label>
-                                <span>Server Path</span>
-                                <input id="integration-server-path" type="text" placeholder="C:\TransTest\Movies or /mnt/movies" />
-                            </label>
-                            <div class="checkbox-stack">
-                                <label><input id="integration-enabled" type="checkbox" checked /> Enabled</label>
-                            </div>
-                            <div class="form-actions">
-                                <button type="button" class="button" id="test-integration-form">Test Before Save</button>
-                                <button type="submit" class="button primary">Add Integration</button>
-                                <span id="integration-form-message" class="form-message"></span>
-                            </div>
-                        </form>
-                        <div class="table-wrap"><table id="integrations-table"></table></div>
-                    </section>
-                </section>
-
-                <section class="page" id="page-settings">
-                    <div class="page-header">
-                        <h1>Settings</h1>
-                        <p>Execution gate, automation, and app-level controls.</p>
-                    </div>
-                    <section class="panel settings-panel">
-                        <h2>Worker Run Mode</h2>
-                        <p class="muted">This is the server-wide execution gate. Use PlanAndReview to inspect plans safely. Use Run staged work to allow cleanup/transcode jobs to run to the staging area. Libraries still decide whether cleanup/transcode jobs can be generated.</p>
-                        <div id="processing-mode-warning" class="mode-warning" hidden></div>
-                        <div class="form-row">
-                            <select id="processing-mode-select">
-                                <option value="Disabled">Disabled - do not lease work</option>
-                                <option value="ScanOnly">Scan only</option>
-                                <option value="ProbeOnly">Probe only</option>
-                                <option value="PlanOnly">Plan only</option>
-                                <option value="PlanAndReview">Plan and review only</option>
-                                <option value="TranscodeToStaging">Run staged work - cleanup/transcode to staging</option>
-                                <option value="ReplaceApproved">Replace approved originals</option>
-                            </select>
-                            <button class="button primary" id="save-processing-mode">Save</button>
-                        </div>
-                        <hr />
-                        <h2>Job Generation Automation</h2>
-                        <p class="muted">These switches decide whether approved plans create queued jobs automatically. The worker run mode controls whether those queued jobs are allowed to execute. Each library also has its own cleanup/transcode generation switches.</p>
-                        <div class="checkbox-stack">
-                            <label><input id="auto-queue-cleanup-jobs" type="checkbox" /> Auto queue cleanup jobs</label>
-                            <label><input id="auto-queue-transcode-jobs" type="checkbox" /> Auto queue transcode jobs</label>
-                            <label><input id="require-review-before-auto-queue" type="checkbox" checked /> Require PlanReview before auto queue</label>
-                        </div>
-                        <hr />
-                        <h2>Active Hours</h2>
-                        <p class="muted">Controls when long staged work can start. With the defaults, Cleanup/Transcode leases can start from 08:30 until 01:30, leaving a 30 minute guard before the NAS shuts down at 02:00.</p>
-                        <div class="checkbox-stack">
-                            <label><input id="active-hours-enabled" type="checkbox" checked /> Enable active-hours gate for Cleanup/Transcode jobs</label>
-                        </div>
-                        <div class="form-grid compact-grid">
-                            <label><span>Time zone</span><input id="active-hours-time-zone" type="text" value="Europe/London" /></label>
-                            <label><span>Start work</span><input id="active-hours-start" type="time" value="08:30" /></label>
-                            <label><span>NAS shutdown / stop time</span><input id="active-hours-stop" type="time" value="02:00" /></label>
-                            <label><span>Stop new work before stop (minutes)</span><input id="active-hours-guard-minutes" type="number" min="0" max="1439" value="30" /></label>
-                        </div>
-                        <p id="active-hours-status" class="muted"></p>
-                        <div class="form-actions">
-                            <button class="button primary" id="save-execution-settings">Save Automation & Active Hours</button>
-                            <span id="execution-settings-message" class="form-message"></span>
-                        </div>
-                    </section>
-
-
-                </section>
-            </main>
-        </div>
-    </div>
-    <div id="plan-modal" class="modal-backdrop" hidden>
-        <section class="modal plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
-            <div class="modal-header">
-                <div>
-                    <h2 id="plan-modal-title">Media Plan</h2>
-                    <p id="plan-modal-subtitle" class="muted"></p>
-                </div>
-                <button class="button" id="close-plan-modal" type="button">Close</button>
+          <div class="page-header">
+            <h1>Integrations</h1>
+            <p>Configure Radarr, Sonarr, TMDb, and path mappings used for metadata lookup.</p>
+          </div>
+          <section class="panel settings-panel">
+            <div class="panel-header">
+              <h2>Integrations</h2>
+              <button class="button" data-refresh="integrations">Refresh</button>
             </div>
-            <div id="plan-modal-content" class="modal-content"></div>
+            <form id="create-integration-form" class="form-grid">
+              <label>
+                <span>Name</span>
+                <input id="integration-name" type="text" placeholder="Radarr" />
+              </label>
+              <label>
+                <span>Type</span>
+                <select id="integration-type">
+                  <option>Radarr</option>
+                  <option>Sonarr</option>
+                  <option>Tmdb</option>
+                  <option>Imdb</option>
+                </select>
+              </label>
+              <label>
+                <span>Base URL</span>
+                <input id="integration-base-url" type="text" placeholder="http://radarr:7878 or https://api.themoviedb.org" />
+              </label>
+              <label>
+                <span>API Key / Token</span>
+                <input id="integration-api-key" type="password" placeholder="Stored by server" />
+              </label>
+              <label>
+                <span>Integration Path</span>
+                <input id="integration-path" type="text" placeholder="/movies or /tv" />
+              </label>
+              <label>
+                <span>Server Path</span>
+                <input id="integration-server-path" type="text" placeholder="C:\TransTest\Movies or /mnt/movies" />
+              </label>
+              <div class="checkbox-stack">
+                <label><input id="integration-enabled" type="checkbox" checked /> Enabled</label>
+              </div>
+              <div class="form-actions">
+                <button type="button" class="button" id="test-integration-form">Test Before Save</button>
+                <button type="submit" class="button primary">Add Integration</button>
+                <span id="integration-form-message" class="form-message"></span>
+              </div>
+            </form>
+            <div class="table-wrap"><table id="integrations-table"></table></div>
+          </section>
         </section>
+
+<section class="page" id="page-settings">
+          <div class="page-header">
+            <h1>Settings</h1>
+            <p>Execution gate, automation, and app-level controls.</p>
+          </div>
+          <section class="panel settings-panel">
+            <h2>Worker Run Mode</h2>
+            <p class="muted">This is the server-wide execution gate. Use PlanAndReview to inspect plans safely. Use Run staged work to allow cleanup/transcode jobs to run to the staging area. Libraries still decide whether cleanup/transcode jobs can be generated.</p>
+            <div id="processing-mode-warning" class="mode-warning" hidden></div>
+            <div class="form-row">
+              <select id="processing-mode-select">
+                <option value="Disabled">Disabled - do not lease work</option>
+                <option value="ScanOnly">Scan only</option>
+                <option value="ProbeOnly">Probe only</option>
+                <option value="PlanOnly">Plan only</option>
+                <option value="PlanAndReview">Plan and review only</option>
+                <option value="TranscodeToStaging">Run staged work - cleanup/transcode to staging</option>
+                <option value="ReplaceApproved">Replace approved originals</option>
+              </select>
+              <button class="button primary" id="save-processing-mode">Save</button>
+            </div>
+            <hr />
+            <h2>Job Generation Automation</h2>
+            <p class="muted">These switches decide whether approved plans create queued jobs automatically. The worker run mode controls whether those queued jobs are allowed to execute. Each library also has its own cleanup/transcode generation switches.</p>
+            <div class="checkbox-stack">
+              <label><input id="auto-queue-cleanup-jobs" type="checkbox" /> Auto queue cleanup jobs</label>
+              <label><input id="auto-queue-transcode-jobs" type="checkbox" /> Auto queue transcode jobs</label>
+              <label><input id="require-review-before-auto-queue" type="checkbox" checked /> Require PlanReview before auto queue</label>
+            </div>
+            <hr />
+            <h2>Active Hours</h2>
+            <p class="muted">Controls when long staged work can start. With the defaults, Cleanup/Transcode leases can start from 08:30 until 01:30, leaving a 30 minute guard before the NAS shuts down at 02:00.</p>
+            <div class="checkbox-stack">
+              <label><input id="active-hours-enabled" type="checkbox" checked /> Enable active-hours gate for Cleanup/Transcode jobs</label>
+            </div>
+            <div class="form-grid compact-grid">
+              <label><span>Time zone</span><input id="active-hours-time-zone" type="text" value="Europe/London" /></label>
+              <label><span>Start work</span><input id="active-hours-start" type="time" value="08:30" /></label>
+              <label><span>NAS shutdown / stop time</span><input id="active-hours-stop" type="time" value="02:00" /></label>
+              <label><span>Stop new work before stop (minutes)</span><input id="active-hours-guard-minutes" type="number" min="0" max="1439" value="30" /></label>
+            </div>
+            <p id="active-hours-status" class="muted"></p>
+            <div class="form-actions">
+              <button class="button primary" id="save-execution-settings">Save Automation & Active Hours</button>
+              <span id="execution-settings-message" class="form-message"></span>
+            </div>
+          </section>
+
+
+        </section>
+      </main>
     </div>
-    <script src="/js/app.js?v=31.6"></script>
-    <script src="/js/media-browser-stopgap.js?v=31.7"></script>
-    <script src="/js/manual-transcode.js?v=31.6"></script>
-    <script src="/js/runtime-settings.js?v=31.6"></script>
-    <script src="/js/review-approve-all.js?v=31.8"></script>
+  </div>
+  <div id="plan-modal" class="modal-backdrop" hidden>
+    <section class="modal plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="plan-modal-title">Media Plan</h2>
+          <p id="plan-modal-subtitle" class="muted"></p>
+        </div>
+        <button class="button" id="close-plan-modal" type="button">Close</button>
+      </div>
+      <div id="plan-modal-content" class="modal-content"></div>
+    </section>
+  </div>
+  <script src="/js/app.js?v=31.2"></script>
+  <script src="/js/media-workflow-controls.js?v=32.1"></script>
 </body>
 </html>

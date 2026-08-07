@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -27,6 +29,11 @@ public sealed class WorkerLoopService(
 
     private WorkerCapabilitiesDto _capabilities = new();
     private WorkerControlState _controlState = WorkerControlState.Normal;
+    private bool _gamingGuardDraining;
+    private DateTime? _gamingGuardGameSinceUtc;
+    private DateTime? _gamingGuardClearSinceUtc;
+    private DateTime _gamingGuardNextCheckUtc = DateTime.MinValue;
+    private string? _gamingGuardLastReason;
     private int _pollSeconds = 10;
     private DateTime? _idleSinceUtc;
     private readonly ConcurrentDictionary<long, ActiveJobState> _activeJobs = new();
@@ -71,6 +78,7 @@ public sealed class WorkerLoopService(
             {
                 var heartbeat = await SendHeartbeatAsync(stoppingToken);
                 _controlState = heartbeat.ControlState;
+                await EvaluateGamingGuardAsync(stoppingToken);
 
                 if (await ApplyRuntimeSettingsAsync(stoppingToken))
                     heartbeat.PathCheckRequired = true;
@@ -78,7 +86,7 @@ public sealed class WorkerLoopService(
                 if (heartbeat.PathCheckRequired)
                     await RunPathChecksAsync(heartbeat.PathChecks, stoppingToken);
 
-                if (heartbeat.AcceptNewWork && _controlState == WorkerControlState.Normal)
+                if (heartbeat.AcceptNewWork && _controlState == WorkerControlState.Normal && !_gamingGuardDraining)
                 {
                     var leaseResponse = await RequestAndStartWorkAsync(stoppingToken);
                     _controlState = leaseResponse.ControlState;
@@ -127,6 +135,175 @@ public sealed class WorkerLoopService(
             logger.LogWarning(ex, "Could not apply runtime worker settings from server.");
             return false;
         }
+    }
+
+    private async Task EvaluateGamingGuardAsync(CancellationToken cancellationToken)
+    {
+        if (!_options.GamingGuard.Enabled)
+            return;
+
+        var now = DateTime.UtcNow;
+        var pollSeconds = Math.Max(5, _options.GamingGuard.PollSeconds);
+        if (now < _gamingGuardNextCheckUtc)
+            return;
+
+        _gamingGuardNextCheckUtc = now.AddSeconds(pollSeconds);
+
+        bool gameRunning;
+        string? reason;
+        try
+        {
+            (gameRunning, reason) = await DetectGameRunningAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Gaming guard detection failed; leaving current drain state unchanged.");
+            return;
+        }
+
+        if (gameRunning)
+        {
+            _gamingGuardClearSinceUtc = null;
+            _gamingGuardGameSinceUtc ??= now;
+            _gamingGuardLastReason = reason;
+
+            var runningFor = now - _gamingGuardGameSinceUtc.Value;
+            if (!_gamingGuardDraining && runningFor.TotalSeconds >= Math.Max(1, _options.GamingGuard.GameRunningSecondsBeforeDrain))
+            {
+                _gamingGuardDraining = true;
+                logger.LogWarning("Gaming guard entering drain mode after {Seconds:n0}s of game activity. Reason: {Reason}", runningFor.TotalSeconds, reason ?? "game detected");
+            }
+            return;
+        }
+
+        _gamingGuardGameSinceUtc = null;
+        _gamingGuardClearSinceUtc ??= now;
+
+        if (_gamingGuardDraining)
+        {
+            var clearFor = now - _gamingGuardClearSinceUtc.Value;
+            if (clearFor.TotalSeconds >= Math.Max(1, _options.GamingGuard.NoGameSecondsBeforeResume))
+            {
+                _gamingGuardDraining = false;
+                _gamingGuardLastReason = null;
+                logger.LogInformation("Gaming guard leaving drain mode after {Seconds:n0}s with no game detected.", clearFor.TotalSeconds);
+            }
+        }
+    }
+
+    private async Task<(bool Running, string? Reason)> DetectGameRunningAsync(CancellationToken cancellationToken)
+    {
+        var command = _options.GamingGuard.DetectionCommand;
+        if (!string.IsNullOrWhiteSpace(command))
+        {
+            var exitCode = await RunDetectionCommandAsync(command, cancellationToken);
+            if (exitCode == 0)
+                return (true, $"detection command returned 0: {command}");
+        }
+
+        var processNames = _options.GamingGuard.ProcessNames
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .ToList();
+
+        if (processNames.Count > 0)
+        {
+            foreach (var process in Process.GetProcesses())
+            {
+                try
+                {
+                    var name = process.ProcessName;
+                    if (processNames.Any(x => name.Equals(x, StringComparison.OrdinalIgnoreCase) || name.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                        return (true, $"process '{name}' matched GamingGuard.ProcessNames");
+                }
+                catch
+                {
+                    // Processes can exit while being inspected.
+                }
+            }
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            var linuxMatch = DetectLinuxSteamGameProcess();
+            if (linuxMatch is not null)
+                return (true, linuxMatch);
+        }
+
+        return (false, null);
+    }
+
+    private static async Task<int> RunDetectionCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "cmd.exe" : "/bin/sh",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            startInfo.ArgumentList.Add("/C");
+            startInfo.ArgumentList.Add(command);
+        }
+        else
+        {
+            startInfo.ArgumentList.Add("-lc");
+            startInfo.ArgumentList.Add(command);
+        }
+
+        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("Could not start gaming guard detection command.");
+        await process.WaitForExitAsync(cancellationToken);
+        return process.ExitCode;
+    }
+
+    private string? DetectLinuxSteamGameProcess()
+    {
+        var commandLineNeedles = _options.GamingGuard.CommandLineContains
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .ToList();
+
+        foreach (var procDir in Directory.EnumerateDirectories("/proc"))
+        {
+            var pidName = Path.GetFileName(procDir);
+            if (!int.TryParse(pidName, out _))
+                continue;
+
+            try
+            {
+                var commPath = Path.Combine(procDir, "comm");
+                var comm = File.Exists(commPath) ? File.ReadAllText(commPath).Trim() : string.Empty;
+                if (comm.Equals("steam", StringComparison.OrdinalIgnoreCase) ||
+                    comm.Equals("steamwebhelper", StringComparison.OrdinalIgnoreCase) ||
+                    comm.Equals("gamescope", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var cmdlinePath = Path.Combine(procDir, "cmdline");
+                var environPath = Path.Combine(procDir, "environ");
+                var cmdline = File.Exists(cmdlinePath) ? File.ReadAllText(cmdlinePath).Replace('\0', ' ') : string.Empty;
+                var environ = File.Exists(environPath) ? File.ReadAllText(environPath).Replace('\0', ' ') : string.Empty;
+                var haystack = cmdline + " " + environ;
+
+                if (haystack.Contains("SteamGameId=", StringComparison.OrdinalIgnoreCase) && !comm.Contains("steam", StringComparison.OrdinalIgnoreCase))
+                    return $"Linux process {pidName}/{comm} has SteamGameId environment";
+
+                foreach (var needle in commandLineNeedles)
+                {
+                    if (haystack.Contains(needle, StringComparison.OrdinalIgnoreCase))
+                        return $"Linux process {pidName}/{comm} matched '{needle}'";
+                }
+            }
+            catch
+            {
+                // /proc entries may disappear or be unreadable; ignore and continue.
+            }
+        }
+
+        return null;
     }
 
     private async Task<WorkerRegisterResponse> RegisterAsync(CancellationToken cancellationToken)
@@ -373,6 +550,18 @@ public sealed class WorkerLoopService(
 
     private WorkerCapacityDto BuildAvailableCapacity()
     {
+        if (_gamingGuardDraining)
+        {
+            return new WorkerCapacityDto
+            {
+                Probe = 0,
+                PlanReview = 0,
+                Cleanup = 0,
+                Transcode = 0,
+                Validation = 0
+            };
+        }
+
         var stagingBacklogFull = IsStagingCopyBacklogFull();
         var localPipelineRemaining = GetLocalPipelineRemainingSlots();
 
@@ -440,10 +629,11 @@ public sealed class WorkerLoopService(
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Probe, MaxJobs = capacity.Probe });
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.PlanReview, MaxJobs = capacity.PlanReview });
         }
-        if (_options.Roles.HasFlag(WorkerRole.Cleanup))
-            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Cleanup, MaxJobs = capacity.Cleanup });
         if (_options.Roles.HasFlag(WorkerRole.Transcoder))
+        {
+            requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Cleanup, MaxJobs = capacity.Cleanup });
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.Transcode, MaxJobs = capacity.Transcode });
+        }
         if (_options.Roles.HasFlag(WorkerRole.Validator))
             requests.Add(new JobLeaseRequestItemDto { JobType = JobType.ValidateOutput, MaxJobs = capacity.Validation });
         return requests.Where(x => x.MaxJobs > 0).ToList();

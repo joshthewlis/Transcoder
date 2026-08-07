@@ -8,7 +8,7 @@ public sealed class WorkerOptions
     public string ApiKey { get; set; } = "dev-worker-key";
     public string WorkerId { get; set; } = Environment.MachineName.ToLowerInvariant();
     public string WorkerName { get; set; } = Environment.MachineName;
-    public WorkerRole Roles { get; set; } = WorkerRole.Prober | WorkerRole.Cleanup | WorkerRole.Transcoder | WorkerRole.Validator;
+    public WorkerRole Roles { get; set; } = WorkerRole.Prober;
     public string FfmpegPath { get; set; } = "ffmpeg";
     public string FfprobePath { get; set; } = "ffprobe";
     public bool StopIfRequiredToolsMissing { get; set; } = true;
@@ -22,7 +22,20 @@ public sealed class WorkerOptions
     public WorkerLimitsDto Limits { get; set; } = new();
     public List<PathMappingOptions> PathMappings { get; set; } = [];
     public ShutdownOptions Shutdown { get; set; } = new();
+    public GamingGuardOptions GamingGuard { get; set; } = new();
 }
+
+public sealed class GamingGuardOptions
+{
+    public bool Enabled { get; set; }
+    public int PollSeconds { get; set; } = 15;
+    public int GameRunningSecondsBeforeDrain { get; set; } = 60;
+    public int NoGameSecondsBeforeResume { get; set; } = 1200;
+    public List<string> ProcessNames { get; set; } = [];
+    public List<string> CommandLineContains { get; set; } = ["/steamapps/common/", "SteamGameId="];
+    public string? DetectionCommand { get; set; }
+}
+
 
 public sealed class WorkerTranscodingOptions
 {
