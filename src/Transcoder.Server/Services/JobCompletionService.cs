@@ -149,7 +149,29 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
 
         if (job.JobType == JobType.Probe && job.MediaItemId is not null)
         {
-            await planner.BuildAndQueuePlanAsync(job.MediaItemId.Value, force: true, cancellationToken);
+            var requestedAfterPlan = ReadRequestedWorkIntent(job.PayloadJson, "queueAfterPlanJobType");
+            if (requestedAfterPlan is JobType.Cleanup or JobType.Transcode)
+            {
+                var plan = await planner.BuildAndQueuePlanForRequestedWorkAsync(
+                    job.MediaItemId.Value,
+                    requestedAfterPlan.Value,
+                    force: true,
+                    cancellationToken: cancellationToken);
+
+                if (plan is not null)
+                {
+                    // If PlanReview is required this call will be rejected for now, but the
+                    // requested work intent was attached to the PlanReview job by the planner
+                    // and will continue automatically after approval.
+                    _ = requestedAfterPlan == JobType.Cleanup
+                        ? await planner.QueueCleanupFromExistingPlanAsync(job.MediaItemId.Value, cancellationToken)
+                        : await planner.QueueTranscodeFromExistingPlanAsync(job.MediaItemId.Value, cancellationToken);
+                }
+            }
+            else
+            {
+                await planner.BuildAndQueuePlanAsync(job.MediaItemId.Value, force: true, cancellationToken);
+            }
         }
 
         return true;
@@ -370,6 +392,29 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         if (value.ValueKind == System.Text.Json.JsonValueKind.Number && value.TryGetDouble(out var number)) return number;
         if (value.ValueKind == System.Text.Json.JsonValueKind.String && double.TryParse(value.GetString(), out var parsed)) return parsed;
         return null;
+    }
+
+    private static JobType? ReadRequestedWorkIntent(string? payloadJson, string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (!doc.RootElement.TryGetProperty(propertyName, out var value))
+                return null;
+
+            var text = value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
+            return Enum.TryParse<JobType>(text, ignoreCase: true, out var parsed)
+                && parsed is JobType.Cleanup or JobType.Transcode
+                ? parsed
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static bool? TryGetBool(System.Text.Json.JsonElement element, string propertyName)

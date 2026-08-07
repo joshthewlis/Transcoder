@@ -24,47 +24,107 @@
     if (typeof refreshReview === 'function') await refreshReview();
   };
 
-  const currentLibraryId = () => window.state?.mediaBrowser?.libraryId;
-  const currentPath = () => window.state?.mediaBrowser?.path || '';
+  // app.js keeps `state` as a top-level const rather than window.state. Read the visible
+  // selector first so an auto-selected Movies library is also the library used by actions.
+  const currentLibraryId = () => {
+    const select = document.getElementById('media-browser-library');
+    const selected = Number(select?.value || 0);
+    if (selected > 0) return selected;
+    const fromWindow = Number(window.state?.mediaBrowser?.libraryId || 0);
+    return fromWindow > 0 ? fromWindow : null;
+  };
+
+  const currentPath = () => {
+    if (window.state?.mediaBrowser?.path) return window.state.mediaBrowser.path;
+    const breadcrumb = document.getElementById('media-browser-path');
+    return breadcrumb?.dataset?.path || '';
+  };
+
   const scopeText = () => currentPath() || 'entire selected library';
 
-  async function replanFolder(queueAfterReplan = false, jobType = null) {
+  async function recalculateFolder(queueAfterReplan = false, jobType = null) {
     const libraryId = currentLibraryId();
     if (!libraryId) return alert('Select a library first.');
+
     const scope = scopeText();
-    const label = queueAfterReplan ? `replan and queue ${jobType || 'eligible work'} for ${scope}` : `replan ${scope}`;
-    if (!confirm(`Run ${label}?\n\nThis clears stale cached plans for this scope and regenerates them from existing probe data. Running jobs are skipped.`)) return;
-    msg(`Running ${label}...`);
-    const result = await workflowApi('/api/media/workflow/replan-folder', {
-      method: 'POST',
-      body: JSON.stringify({ libraryId, path: currentPath(), includeFinal: false, queueAfterReplan, jobType })
-    });
-    const summary = (result.messages || []).join('\n') || `Considered ${result.considered || 0}, planned ${result.planned || 0}, queued ${result.queued || 0}.`;
-    msg(summary, 'ok');
-    alert(summary);
-    await refresh();
+    const action = queueAfterReplan
+      ? `recalculate plans and queue ${jobType || 'eligible work'} for ${scope}`
+      : `recalculate plans for ${scope}`;
+
+    if (!confirm(
+      `Run ${action}?\n\n` +
+      `Completed cleanup/transcode savings and processing history are preserved. ` +
+      `Only future plans/reviews/queued work are recalculated. Running jobs are skipped.`
+    )) return;
+
+    msg(`Running ${action}...`);
+    try {
+      const result = await workflowApi('/api/media/workflow/replan-folder', {
+        method: 'POST',
+        body: JSON.stringify({
+          libraryId,
+          path: currentPath(),
+          // A cleaned/replaced item is still eligible for a later transcode phase.
+          includeFinal: jobType === 'Transcode',
+          queueAfterReplan,
+          jobType
+        })
+      });
+
+      const summary = (result.messages || []).join('\n') ||
+        `Considered ${result.considered || 0}, planned ${result.planned || 0}, queued ${result.queued || 0}.`;
+      msg(summary, 'ok');
+      alert(summary);
+      await refresh();
+    } catch (error) {
+      msg(error.message || String(error), 'bad');
+      alert(error.message || error);
+    }
   }
 
   async function queueFolder(jobType) {
     const libraryId = currentLibraryId();
     if (!libraryId) return alert('Select a library first.');
+
     const scope = scopeText();
-    if (!confirm(`Queue ${jobType} for ${scope}?\n\nBlocked/stale items will be replanned first. Running jobs are left alone.`)) return;
+    if (!confirm(
+      `Queue ${jobType} for ${scope}?\n\n` +
+      `Items with stale/incompatible plans will be recalculated safely first. ` +
+      `Completed savings/history are never reset. Running jobs are left alone.`
+    )) return;
+
     msg(`Queueing ${jobType} for ${scope}...`);
-    const result = await workflowApi('/api/media/workflow/queue-folder', {
-      method: 'POST',
-      body: JSON.stringify({ libraryId, path: currentPath(), jobType, replanWhenBlocked: true })
-    });
-    const summary = (result.messages || []).join('\n') || `Queued ${result.queued || 0}, already ${result.alreadyQueued || 0}, skipped ${result.skipped || 0}, replanned ${result.replanned || 0}.`;
-    msg(summary, result.queued ? 'ok' : 'warn');
-    alert(summary);
-    await refresh();
+    try {
+      const result = await workflowApi('/api/media/workflow/queue-folder', {
+        method: 'POST',
+        body: JSON.stringify({
+          libraryId,
+          path: currentPath(),
+          jobType,
+          replanWhenBlocked: true
+        })
+      });
+
+      const summary = (result.messages || []).join('\n') ||
+        `Queued ${result.queued || 0}, already ${result.alreadyQueued || 0}, skipped ${result.skipped || 0}, recalculated ${result.replanned || 0}.`;
+      msg(summary, result.queued || result.replanned ? 'ok' : 'warn');
+      alert(summary);
+      await refresh();
+    } catch (error) {
+      msg(error.message || String(error), 'bad');
+      alert(error.message || error);
+    }
   }
 
   async function approveAllReviews() {
-    if (!confirm('Approve ALL current Review items and hidden limbo reviews?\n\nThis is a bulk approval. Use it only when you are happy to approve the current plan warnings.')) return;
+    if (!confirm(
+      'Approve ALL current Review items and hidden limbo reviews?\n\n' +
+      'Any library action waiting for PlanReview approval can continue automatically after approval.'
+    )) return;
+
     const result = await workflowApi('/api/media/workflow/reviews/approve-all?includeLimbo=true', { method: 'POST' });
-    const summary = (result.messages || []).join('\n') || `Approved ${result.approvedMediaItems || 0}; resolved ${result.resolvedReviewItems || 0}.`;
+    const summary = (result.messages || []).join('\n') ||
+      `Approved ${result.approvedMediaItems || 0}; resolved ${result.resolvedReviewItems || 0}.`;
     alert(summary);
     await refresh();
   }
@@ -76,18 +136,35 @@
     await refresh();
   }
 
+  async function recalculateMedia(mediaId) {
+    if (!confirm(
+      'Recalculate this media item using the current policy?\n\n' +
+      'Completed cleanup/transcode savings, processing history, and completed jobs are preserved.'
+    )) return;
+
+    try {
+      // Keep the old route for API compatibility; the server no longer performs a destructive reset.
+      const result = await workflowApi(`/api/media/${mediaId}/reset-replan`, { method: 'POST' });
+      alert(result.message || 'Plan recalculated.');
+      await refresh();
+    } catch (error) {
+      alert(error.message || error);
+    }
+  }
+
   function addMediaButtons() {
     const librarySelect = document.getElementById('media-browser-library');
     if (!librarySelect || document.getElementById('workflow-replan-folder')) return;
+
     const row = librarySelect.closest?.('.form-row') || librarySelect.parentElement;
     if (!row) return;
 
     const buttons = [
-      ['workflow-replan-folder', 'Replan Current', () => replanFolder(false, null)],
-      ['workflow-replan-queue-cleanup', 'Replan + Queue Cleanup', () => replanFolder(true, 'Cleanup')],
-      ['workflow-replan-queue-transcode', 'Replan + Queue Transcode', () => replanFolder(true, 'Transcode')],
-      ['workflow-queue-cleanup', 'Queue Cleanup Fixed', () => queueFolder('Cleanup')],
-      ['workflow-queue-transcode', 'Queue Transcode Fixed', () => queueFolder('Transcode')]
+      ['workflow-replan-folder', 'Recalculate Current', () => recalculateFolder(false, null)],
+      ['workflow-replan-queue-cleanup', 'Recalculate + Queue Cleanup', () => recalculateFolder(true, 'Cleanup')],
+      ['workflow-replan-queue-transcode', 'Recalculate + Queue Transcode', () => recalculateFolder(true, 'Transcode')],
+      ['workflow-queue-cleanup', 'Queue Cleanup', () => queueFolder('Cleanup')],
+      ['workflow-queue-transcode', 'Queue Transcode', () => queueFolder('Transcode')]
     ];
 
     for (const [id, text, handler] of buttons) {
@@ -108,9 +185,17 @@
     }
   }
 
+  function relabelLegacyResetButtons() {
+    document.querySelectorAll('button[onclick*="resetReplanMedia"]').forEach(button => {
+      button.textContent = 'Recalculate Plan';
+      button.title = 'Recalculate the future plan. Completed savings and processing history are preserved.';
+    });
+  }
+
   function addReviewButtons() {
     const table = document.getElementById('review-table');
     if (!table || document.getElementById('workflow-approve-all-reviews')) return;
+
     const container = table.parentElement || table;
     const row = document.createElement('div');
     row.className = 'button-row workflow-review-tools';
@@ -124,10 +209,17 @@
   }
 
   setInterval(() => {
-    try { addMediaButtons(); addReviewButtons(); } catch { }
-  }, 1000);
+    try {
+      addMediaButtons();
+      addReviewButtons();
+      relabelLegacyResetButtons();
+    } catch { }
+  }, 500);
 
-  window.workflowReplanFolder = replanFolder;
+  // Override the legacy app.js action so the old Reset/Replan button cannot perform a reset,
+  // even before the DOM relabel interval has run.
+  window.resetReplanMedia = recalculateMedia;
+  window.workflowReplanFolder = recalculateFolder;
   window.workflowQueueFolder = queueFolder;
   window.workflowApproveAllReviews = approveAllReviews;
   window.workflowRepairLimboReviews = repairLimboReviews;

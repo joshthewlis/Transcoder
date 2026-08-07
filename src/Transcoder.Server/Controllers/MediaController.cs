@@ -167,6 +167,8 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
     [HttpPost("{mediaId:long}/reset-replan")]
     public async Task<ActionResult<ResetReplanMediaResultDto>> ResetAndReplan(long mediaId, CancellationToken cancellationToken = default)
     {
+        // Backwards-compatible route: this is now a SAFE plan recalculation.
+        // Completed processing facts (MetadataJson), probe data, and staging history are never reset here.
         var item = await db.MediaItems.Include(x => x.Library).FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
         if (item is null) return NotFound();
 
@@ -178,21 +180,24 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
         };
 
         var activeJobs = await db.Jobs
-            .Where(x => x.MediaItemId == item.Id && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
+            .Where(x => x.MediaItemId == item.Id
+                && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
             .OrderBy(x => x.Id)
             .ToListAsync(cancellationToken);
 
         var runningJobs = activeJobs.Where(x => x.Status is JobStatus.Leased or JobStatus.Running).ToList();
         if (runningJobs.Count > 0)
         {
-            result.Message = $"Media has {runningJobs.Count} leased/running job(s). Drain or cancel active work before resetting this item.";
+            result.Message = $"Media has {runningJobs.Count} leased/running job(s). Recalculation was skipped so active work is not invalidated.";
             return Conflict(result);
         }
 
-        foreach (var job in activeJobs.Where(x => x.Status == JobStatus.Queued))
+        // Only future/stale work is cancelled. Completed jobs and their result ledger remain immutable.
+        foreach (var job in activeJobs.Where(x => x.Status == JobStatus.Queued
+            && x.JobType is JobType.PlanReview or JobType.Cleanup or JobType.Transcode))
         {
             job.Status = JobStatus.Cancelled;
-            job.LastMessage = "Cancelled by Reset/Replan.";
+            job.LastMessage = "Cancelled because the plan was recalculated.";
             job.LastError = null;
             job.LeaseId = null;
             job.LastLeaseId = null;
@@ -215,58 +220,28 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
             result.ResolvedReviewItems++;
         }
 
-        item.PlanJson = null;
-        item.PlanHash = null;
-        item.PlanReviewJson = null;
-        item.PlanCreatedUtc = null;
-        item.PlanReviewedUtc = null;
-        item.StagingPath = null;
-        item.MetadataJson = null;
-        item.MetadataError = null;
-        item.UpdatedUtc = DateTime.UtcNow;
-        item.Status = string.IsNullOrWhiteSpace(item.ProbeJson) ? MediaStatus.New : MediaStatus.Probed;
-
         await db.SaveChangesAsync(cancellationToken);
 
-        result.Reset = true;
+        // Do NOT clear PlanJson first: the planner archives the previous revision before replacing it.
+        // Do NOT clear MetadataJson: it contains completed cleanup/transcode savings and history.
+        var plan = await planner.BuildAndQueuePlanAsync(mediaId, force: true, cancellationToken);
 
-        if (string.IsNullOrWhiteSpace(item.ProbeJson))
+        if (plan is null)
         {
-            db.Jobs.Add(new JobEntity
-            {
-                JobType = JobType.Probe,
-                Status = JobStatus.Queued,
-                LibraryId = item.LibraryId,
-                MediaItemId = item.Id,
-                PayloadJson = JsonSerializer.Serialize(new
-                {
-                    libraryId = item.LibraryId,
-                    mediaId = item.Id,
-                    inputPath = item.FullPath,
-                    fileSizeBytes = item.FileSizeBytes,
-                    lastModifiedUtc = item.LastModifiedUtc
-                }, JsonOptions)
-            });
-            item.Status = MediaStatus.ProbeQueued;
-            item.UpdatedUtc = DateTime.UtcNow;
-            await db.SaveChangesAsync(cancellationToken);
-
             result.ProbeQueued = true;
-            result.MediaStatus = item.Status;
-            result.Message = "Media reset. Probe was queued because no probe data exists yet.";
+            var refreshedWithoutPlan = await db.MediaItems.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
+            result.MediaStatus = refreshedWithoutPlan?.Status;
+            result.Message = "Probe data is required. A probe has been queued; the plan will be generated when probing completes.";
             return Accepted(result);
         }
 
-        var plan = await planner.BuildAndQueuePlanAsync(mediaId, force: true, cancellationToken);
-        result.PlanGenerated = plan is not null;
-
+        result.PlanGenerated = true;
         var refreshed = await db.MediaItems.AsNoTracking().FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
         result.MediaStatus = refreshed?.Status;
-        result.Message = plan is null
-            ? "Media reset. Probe is required before a new plan can be generated."
-            : plan.BlockingReasons.Count > 0
-                ? "Media reset and re-planned. Blocking reasons were recreated in Review."
-                : "Media reset and re-planned.";
+        result.Message = plan.BlockingReasons.Count > 0
+            ? "Plan recalculated. Completed savings/history were preserved; blocking reasons were added to Review."
+            : "Plan recalculated. Completed savings/history were preserved.";
 
         return Ok(result);
     }
@@ -428,9 +403,12 @@ public sealed class MediaController(TranscoderDbContext db, TranscodePlanService
     {
         var planSummary = MediaProcessingStatsStore.ReadPlanSummary(item.PlanJson);
         var stats = MediaProcessingStatsStore.Read(item);
+        // Stage savings are completed processing facts and must remain visible across replans.
+        // Disk-level total/output remain tied to replacement because staged output has not replaced
+        // the current file until ReplacedOriginal is true.
         var actualSaved = stats.ReplacedOriginal ? stats.SavedBytes : null;
-        var actualCleanupSaved = stats.ReplacedOriginal ? stats.CleanupSavedBytes : null;
-        var actualTranscodeSaved = stats.ReplacedOriginal ? stats.TranscodeSavedBytes : null;
+        var actualCleanupSaved = stats.CleanupSavedBytes;
+        var actualTranscodeSaved = stats.TranscodeSavedBytes;
         var actualTotalSaved = stats.ReplacedOriginal ? stats.TotalSavedBytes ?? stats.SavedBytes : null;
         var actualOutputSize = stats.ReplacedOriginal ? stats.OutputSizeBytes : null;
 

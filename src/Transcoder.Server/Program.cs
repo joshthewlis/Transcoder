@@ -38,6 +38,7 @@ builder.Services.AddScoped<MetadataRefreshService>();
 builder.Services.AddScoped<StorageMapImportService>();
 builder.Services.AddScoped<LibraryScanner>();
 builder.Services.AddScoped<StorageInitializer>();
+builder.Services.AddScoped<ProcessingFactsRepairService>();
 builder.Services.AddHostedService<LibraryScanBackgroundService>();
 builder.Services.AddHostedService<LibraryWatcherBackgroundService>();
 builder.Services.AddHostedService<WorkerMonitorService>();
@@ -84,6 +85,14 @@ using (var scope = app.Services.CreateScope())
 
     ProfileSeeder.SeedDefaultsAsync(db).GetAwaiter().GetResult();
     scope.ServiceProvider.GetRequiredService<StorageInitializer>().EnsureStorageFolders();
+
+    // Upgrade repair: older Reset/Replan behaviour could clear MetadataJson and therefore
+    // hide completed cleanup/transcode savings. Completed job results are immutable enough
+    // to restore those stage facts. This is idempotent and only fills missing values.
+    scope.ServiceProvider.GetRequiredService<ProcessingFactsRepairService>()
+        .RepairAsync()
+        .GetAwaiter()
+        .GetResult();
 }
 
 if (app.Environment.IsDevelopment())

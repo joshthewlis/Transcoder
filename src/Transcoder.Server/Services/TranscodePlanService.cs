@@ -134,6 +134,20 @@ public sealed class TranscodePlanService(
                     : MediaStatus.ReadyToTranscode;
 
             await QueueWorkIfAutoAllowedAsync(media, plan, cancellationToken);
+
+            var requestedAfterReview = ReadRequestedWorkIntent(job.PayloadJson, "queueAfterReviewJobType");
+            if (requestedAfterReview is JobType.Cleanup or JobType.Transcode)
+            {
+                var explicitQueue = requestedAfterReview == JobType.Cleanup
+                    ? await QueueCleanupFromExistingPlanAsync(media.Id, cancellationToken)
+                    : await QueueTranscodeFromExistingPlanAsync(media.Id, cancellationToken);
+
+                logger.LogInformation(
+                    "PlanReview approved for {Media}; requested {JobType} continuation: {Message}",
+                    media.RelativePath,
+                    requestedAfterReview,
+                    explicitQueue.Message);
+            }
         }
         else
         {
@@ -270,6 +284,43 @@ public sealed class TranscodePlanService(
 
     public async Task<QueueLibraryWorkResultDto> QueueLibraryTranscodeFromExistingPlansAsync(int libraryId, CancellationToken cancellationToken = default) =>
         await QueueLibraryExistingPlanWorkAsync(libraryId, JobType.Transcode, cancellationToken);
+
+    /// <summary>
+    /// Recalculates a plan while preserving completed processing facts/history and records the
+    /// user's requested next action on any PlanReview job. This lets a one-click library action
+    /// continue automatically after worker review approval without treating a replan as a reset.
+    /// </summary>
+    public async Task<TranscodePlanDto?> BuildAndQueuePlanForRequestedWorkAsync(
+        long mediaId,
+        JobType requestedJobType,
+        bool force = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (requestedJobType is not (JobType.Cleanup or JobType.Transcode))
+            throw new ArgumentOutOfRangeException(nameof(requestedJobType), "Requested work must be Cleanup or Transcode.");
+
+        var plan = await BuildAndQueuePlanAsync(mediaId, force, cancellationToken);
+        if (plan is null)
+            return null;
+
+        var reviewJob = await db.Jobs
+            .Where(x => x.MediaItemId == mediaId
+                && x.JobType == JobType.PlanReview
+                && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
+            .OrderByDescending(x => x.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (reviewJob is not null)
+        {
+            reviewJob.PayloadJson = MergeRequestedWorkIntent(
+                reviewJob.PayloadJson,
+                "queueAfterReviewJobType",
+                requestedJobType);
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
+        return plan;
+    }
 
     public async Task<PilotRunResultDto> QueueLibraryPilotRunAsync(int libraryId, PilotRunRequestDto? request, CancellationToken cancellationToken = default)
     {
@@ -1920,6 +1971,48 @@ public sealed class TranscodePlanService(
         }
 
         return new StreamSizeEstimate(null, null);
+    }
+
+    private static string MergeRequestedWorkIntent(
+        string? payloadJson,
+        string propertyName,
+        JobType requestedJobType)
+    {
+        Dictionary<string, object?> payload;
+        try
+        {
+            payload = string.IsNullOrWhiteSpace(payloadJson)
+                ? new Dictionary<string, object?>()
+                : JsonSerializer.Deserialize<Dictionary<string, object?>>(payloadJson, JsonOptions)
+                    ?? new Dictionary<string, object?>();
+        }
+        catch
+        {
+            payload = new Dictionary<string, object?>();
+        }
+
+        payload[propertyName] = requestedJobType.ToString();
+        return JsonSerializer.Serialize(payload, JsonOptions);
+    }
+
+    private static JobType? ReadRequestedWorkIntent(string? payloadJson, string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            var value = GetString(doc.RootElement, propertyName);
+            return Enum.TryParse<JobType>(value, ignoreCase: true, out var parsed)
+                && parsed is JobType.Cleanup or JobType.Transcode
+                ? parsed
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? GetString(JsonElement element, string propertyName)

@@ -45,7 +45,12 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
         if (request.LibraryId <= 0) return BadRequest(new { message = "libraryId is required." });
         if (request.JobType is not (JobType.Cleanup or JobType.Transcode)) return BadRequest(new { message = "jobType must be Cleanup or Transcode." });
 
-        var ids = await QueryFolderMedia(request.LibraryId, request.Path, includeFinal: false)
+        // Transcode can legitimately follow a completed/replaced cleanup phase, so final
+        // cleanup statuses must remain eligible for reconsideration.
+        var ids = await QueryFolderMedia(
+                request.LibraryId,
+                request.Path,
+                includeFinal: request.JobType == JobType.Transcode)
             .ToListAsync(cancellationToken);
 
         var result = new FolderQueueResultDto
@@ -66,13 +71,34 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
             if (!queueResult.Accepted && request.ReplanWhenBlocked)
             {
                 result.Replanned++;
-                await ResetOneForReplan(id, cancellationToken);
-                var plan = await planner.BuildAndQueuePlanAsync(id, force: true, cancellationToken);
-                if (plan is not null && plan.BlockingReasons.Count == 0)
+                var prepared = await PrepareOneForReplan(id, request.JobType, queueAfterReplan: true, cancellationToken: cancellationToken);
+                if (!prepared.SkippedRunning && !prepared.ProbeQueued)
                 {
-                    queueResult = request.JobType == JobType.Cleanup
-                        ? await planner.QueueCleanupFromExistingPlanAsync(id, cancellationToken)
-                        : await planner.QueueTranscodeFromExistingPlanAsync(id, cancellationToken);
+                    var plan = await planner.BuildAndQueuePlanForRequestedWorkAsync(
+                        id,
+                        request.JobType,
+                        force: true,
+                        cancellationToken: cancellationToken);
+                    if (plan is not null)
+                    {
+                        queueResult = request.JobType == JobType.Cleanup
+                            ? await planner.QueueCleanupFromExistingPlanAsync(id, cancellationToken)
+                            : await planner.QueueTranscodeFromExistingPlanAsync(id, cancellationToken);
+                    }
+                }
+                else if (prepared.ProbeQueued)
+                {
+                    // The probe payload carries the requested work intent. Probe completion will
+                    // generate the plan, survive PlanReview if required, and then queue the work.
+                    queueResult = new QueueMediaWorkResultDto
+                    {
+                        MediaId = id,
+                        Accepted = true,
+                        Queued = false,
+                        AlreadyQueued = false,
+                        JobType = request.JobType,
+                        Message = "Probe queued; requested work will be queued after planning/review."
+                    };
                 }
             }
 
@@ -140,6 +166,7 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
     {
         var now = DateTime.UtcNow;
         var result = new ApproveAllReviewsResultDto();
+        var requestedQueues = new List<(long MediaId, JobType JobType)>();
 
         var reviewMediaIds = await db.ReviewItems
             .Where(x => !x.Resolved)
@@ -188,11 +215,55 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
                 "Transcode" => MediaStatus.ReadyToTranscode,
                 _ => media.Status == MediaStatus.NeedsReview ? MediaStatus.Probed : media.Status
             };
+
+            var currentHistory = await db.MediaPlanHistories
+                .FirstOrDefaultAsync(x => x.MediaItemId == media.Id && x.IsCurrent, cancellationToken);
+            if (currentHistory is not null)
+            {
+                currentHistory.PlanReviewJson = media.PlanReviewJson;
+                currentHistory.PlanReviewedUtc = now;
+            }
+
+            var reviewJob = await db.Jobs
+                .Where(x => x.MediaItemId == media.Id
+                    && x.JobType == JobType.PlanReview
+                    && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
+                .OrderByDescending(x => x.Id)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (reviewJob is not null)
+            {
+                var requested = ReadRequestedWorkIntent(reviewJob.PayloadJson, "queueAfterReviewJobType");
+                if (requested is JobType.Cleanup or JobType.Transcode)
+                    requestedQueues.Add((media.Id, requested.Value));
+
+                if (reviewJob.Status == JobStatus.Queued)
+                {
+                    reviewJob.Status = JobStatus.Cancelled;
+                    reviewJob.LastMessage = "Cancelled because the plan was approved manually.";
+                    reviewJob.CompletedUtc = now;
+                }
+            }
+
             result.ApprovedMediaItems++;
         }
 
         await db.SaveChangesAsync(cancellationToken);
-        result.Messages.Add($"Approved {result.ApprovedMediaItems} media item(s) and resolved {result.ResolvedReviewItems} visible review row(s).");
+
+        var continued = 0;
+        foreach (var requested in requestedQueues.Distinct())
+        {
+            var queued = requested.JobType == JobType.Cleanup
+                ? await planner.QueueCleanupFromExistingPlanAsync(requested.MediaId, cancellationToken)
+                : await planner.QueueTranscodeFromExistingPlanAsync(requested.MediaId, cancellationToken);
+
+            if (queued.Queued || queued.AlreadyQueued)
+                continued++;
+        }
+
+        result.Messages.Add(
+            $"Approved {result.ApprovedMediaItems} media item(s) and resolved {result.ResolvedReviewItems} visible review row(s). " +
+            $"Continued {continued} requested cleanup/transcode workflow(s).");
         return Ok(result);
     }
 
@@ -202,22 +273,37 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
         foreach (var id in ids)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var reset = await ResetOneForReplan(id, cancellationToken);
-            result.CancelledJobs += reset.CancelledJobs;
-            result.ResolvedReviews += reset.ResolvedReviews;
-            if (reset.SkippedRunning)
+
+            var prepared = await PrepareOneForReplan(id, jobType, queueAfterReplan, cancellationToken);
+            result.CancelledJobs += prepared.CancelledJobs;
+            result.ResolvedReviews += prepared.ResolvedReviews;
+            if (prepared.SkippedRunning)
             {
                 result.SkippedRunning++;
                 continue;
             }
 
-            if (reset.ProbeQueued)
+            if (prepared.ProbeQueued)
             {
+                // Intent is stored on the Probe job and will continue automatically after probing.
                 result.ProbeQueued++;
                 continue;
             }
 
-            var plan = await planner.BuildAndQueuePlanAsync(id, force: true, cancellationToken);
+            TranscodePlanDto? plan;
+            if (queueAfterReplan && jobType is JobType.Cleanup or JobType.Transcode)
+            {
+                plan = await planner.BuildAndQueuePlanForRequestedWorkAsync(
+                    id,
+                    jobType.Value,
+                    force: true,
+                    cancellationToken: cancellationToken);
+            }
+            else
+            {
+                plan = await planner.BuildAndQueuePlanAsync(id, force: true, cancellationToken);
+            }
+
             if (plan is null)
             {
                 result.Skipped++;
@@ -231,22 +317,33 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
                 continue;
             }
 
+            if (!queueAfterReplan)
+                continue;
+
             var wanted = jobType ?? (IsCleanupPlan(plan) ? JobType.Cleanup : JobType.Transcode);
-            if (queueAfterReplan && wanted is JobType.Cleanup or JobType.Transcode)
-            {
-                var queued = wanted == JobType.Cleanup
-                    ? await planner.QueueCleanupFromExistingPlanAsync(id, cancellationToken)
-                    : await planner.QueueTranscodeFromExistingPlanAsync(id, cancellationToken);
-                if (queued.Queued) result.Queued++;
-                else if (queued.AlreadyQueued) result.AlreadyQueued++;
-            }
+            var queued = wanted == JobType.Cleanup
+                ? await planner.QueueCleanupFromExistingPlanAsync(id, cancellationToken)
+                : await planner.QueueTranscodeFromExistingPlanAsync(id, cancellationToken);
+
+            if (queued.Queued) result.Queued++;
+            else if (queued.AlreadyQueued) result.AlreadyQueued++;
+            // If PlanReview is required, BuildAndQueuePlanForRequestedWorkAsync stores the
+            // requested work on the review job. It will be queued after approval.
         }
 
-        result.Messages.Add($"Replan finished. Considered {result.Considered}; planned {result.Planned}; probe queued {result.ProbeQueued}; needs review {result.NeedsReview}; skipped running {result.SkippedRunning}; queued {result.Queued}; already queued {result.AlreadyQueued}.");
+        result.Messages.Add(
+            $"Recalculate finished. Considered {result.Considered}; planned {result.Planned}; " +
+            $"probe queued {result.ProbeQueued}; needs review {result.NeedsReview}; " +
+            $"skipped running {result.SkippedRunning}; queued now {result.Queued}; already queued {result.AlreadyQueued}. " +
+            "Completed cleanup/transcode savings and processing history were preserved.");
         return result;
     }
 
-    private async Task<ResetOneResult> ResetOneForReplan(long mediaId, CancellationToken cancellationToken)
+    private async Task<ResetOneResult> PrepareOneForReplan(
+        long mediaId,
+        JobType? requestedJobType,
+        bool queueAfterReplan,
+        CancellationToken cancellationToken)
     {
         var result = new ResetOneResult();
         var item = await db.MediaItems.FirstOrDefaultAsync(x => x.Id == mediaId, cancellationToken);
@@ -257,7 +354,8 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
         }
 
         var activeJobs = await db.Jobs
-            .Where(x => x.MediaItemId == mediaId && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
+            .Where(x => x.MediaItemId == mediaId
+                && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running))
             .ToListAsync(cancellationToken);
 
         if (activeJobs.Any(x => x.Status is JobStatus.Leased or JobStatus.Running))
@@ -266,10 +364,12 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
             return result;
         }
 
-        foreach (var job in activeJobs.Where(x => x.Status == JobStatus.Queued))
+        // Recalculation invalidates queued future work, but never completed work.
+        foreach (var job in activeJobs.Where(x => x.Status == JobStatus.Queued
+            && x.JobType is JobType.PlanReview or JobType.Cleanup or JobType.Transcode))
         {
             job.Status = JobStatus.Cancelled;
-            job.LastMessage = "Cancelled by bulk replan.";
+            job.LastMessage = "Cancelled because the plan was recalculated.";
             job.LastError = null;
             job.LeaseId = null;
             job.LastLeaseId = null;
@@ -281,7 +381,10 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
             result.CancelledJobs++;
         }
 
-        var reviews = await db.ReviewItems.Where(x => x.MediaItemId == mediaId && !x.Resolved).ToListAsync(cancellationToken);
+        var reviews = await db.ReviewItems
+            .Where(x => x.MediaItemId == mediaId && !x.Resolved)
+            .ToListAsync(cancellationToken);
+
         foreach (var review in reviews)
         {
             review.Resolved = true;
@@ -289,19 +392,21 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
             result.ResolvedReviews++;
         }
 
-        item.PlanJson = null;
-        item.PlanHash = null;
-        item.PlanReviewJson = null;
-        item.PlanCreatedUtc = null;
-        item.PlanReviewedUtc = null;
-        item.StagingPath = null;
-        item.MetadataError = null;
+        // Facts are immutable:
+        // - MetadataJson contains completed cleanup/transcode savings/history.
+        // - ProbeJson describes the current file.
+        // - PlanJson is intentionally left in place so TranscodePlanService can archive it
+        //   as the previous plan revision before writing the new current plan.
         item.UpdatedUtc = DateTime.UtcNow;
 
         if (string.IsNullOrWhiteSpace(item.ProbeJson))
         {
             item.Status = MediaStatus.ProbeQueued;
-            if (!await db.Jobs.AnyAsync(x => x.MediaItemId == mediaId && x.JobType == JobType.Probe && (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running), cancellationToken))
+            var existingProbe = activeJobs.FirstOrDefault(x =>
+                x.JobType == JobType.Probe &&
+                (x.Status == JobStatus.Queued || x.Status == JobStatus.Leased || x.Status == JobStatus.Running));
+
+            if (existingProbe is null)
             {
                 db.Jobs.Add(new JobEntity
                 {
@@ -315,19 +420,40 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
                         mediaId = item.Id,
                         inputPath = item.FullPath,
                         fileSizeBytes = item.FileSizeBytes,
-                        lastModifiedUtc = item.LastModifiedUtc
+                        lastModifiedUtc = item.LastModifiedUtc,
+                        queueAfterPlanJobType = queueAfterReplan ? requestedJobType?.ToString() : null
                     }, JsonOptions)
                 });
             }
+            else if (queueAfterReplan && requestedJobType is JobType.Cleanup or JobType.Transcode)
+            {
+                existingProbe.PayloadJson = MergeQueueIntent(existingProbe.PayloadJson, requestedJobType.Value);
+            }
+
             result.ProbeQueued = true;
-        }
-        else
-        {
-            item.Status = MediaStatus.Probed;
         }
 
         await db.SaveChangesAsync(cancellationToken);
         return result;
+    }
+
+    private static string MergeQueueIntent(string? payloadJson, JobType requestedJobType)
+    {
+        Dictionary<string, object?> payload;
+        try
+        {
+            payload = string.IsNullOrWhiteSpace(payloadJson)
+                ? new Dictionary<string, object?>()
+                : JsonSerializer.Deserialize<Dictionary<string, object?>>(payloadJson, JsonOptions)
+                    ?? new Dictionary<string, object?>();
+        }
+        catch
+        {
+            payload = new Dictionary<string, object?>();
+        }
+
+        payload["queueAfterPlanJobType"] = requestedJobType.ToString();
+        return JsonSerializer.Serialize(payload, JsonOptions);
     }
 
     private IQueryable<long> QueryFolderMedia(int libraryId, string? path, bool includeFinal)
@@ -368,6 +494,29 @@ public sealed class MediaWorkflowController(TranscoderDbContext db, TranscodePla
         if (!string.IsNullOrWhiteSpace(media.PlanJson) && media.PlanJson.Contains("blockingReasons", StringComparison.OrdinalIgnoreCase))
             return true;
         return false;
+    }
+
+    private static JobType? ReadRequestedWorkIntent(string? payloadJson, string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (!doc.RootElement.TryGetProperty(propertyName, out var value))
+                return null;
+
+            var text = value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
+            return Enum.TryParse<JobType>(text, ignoreCase: true, out var parsed)
+                && parsed is JobType.Cleanup or JobType.Transcode
+                ? parsed
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? TryReadPlanKind(string? planJson)
