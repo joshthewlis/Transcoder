@@ -46,6 +46,8 @@ public sealed class JobLeaseService(
 
         var response = BuildBaseResponse(worker);
         var mode = await settings.GetProcessingModeAsync(cancellationToken);
+        // ProcessingMode controls workflow generation. Once a job is explicitly queued,
+        // leasing is independent per job type. Disabled remains the one hard global stop.
         var execution = await settings.GetExecutionSettingsAsync(cancellationToken);
         var activeHours = ActiveHoursEvaluator.Evaluate(execution, DateTime.UtcNow);
         response.ActiveHours = activeHours;
@@ -114,9 +116,16 @@ public sealed class JobLeaseService(
 
         foreach (var item in request.Requests.Where(x => x.MaxJobs > 0))
         {
-            if (!IsJobTypeAllowedByMode(item.JobType, mode))
+            // Workers advertise generic per-type capacities in their lease request.
+            // Do not let a request for a type outside the worker's configured roles
+            // consume candidate-query/diagnostic work or influence path-check state.
+            if (!WorkerHasRole(worker.Roles, item.JobType))
             {
-                AddRejection(rejectionReasons, $"{item.JobType}: processing mode {mode} does not allow this job type");
+                logger.LogDebug(
+                    "Ignoring {JobType} lease request from worker {WorkerId}: worker roles are {Roles}",
+                    item.JobType,
+                    worker.WorkerId,
+                    worker.Roles);
                 continue;
             }
 
@@ -126,6 +135,16 @@ public sealed class JobLeaseService(
                 AddRejection(rejectionReasons, $"{item.JobType}: outside configured active hours");
                 continue;
             }
+
+            var queuedForType = await db.Jobs.CountAsync(j =>
+                j.Status == JobStatus.Queued && j.JobType == item.JobType, cancellationToken);
+
+            logger.LogDebug(
+                "Worker {WorkerId} requests {RequestedSlots} {JobType} slot(s); queued={QueuedForType}",
+                worker.WorkerId,
+                item.MaxJobs,
+                item.JobType,
+                queuedForType);
 
             var candidateLimit = Math.Max(item.MaxJobs * 25, 100);
             var candidates = (await db.Jobs
@@ -214,6 +233,18 @@ public sealed class JobLeaseService(
         response.ServerHasAnyWork = await db.Jobs.AnyAsync(x => x.Status == JobStatus.Queued, cancellationToken);
         response.ServerHasWorkForThisWorker = leases.Count > 0;
 
+        if (leases.Count > 0)
+        {
+            var leasedSummary = string.Join(", ", leases
+                .GroupBy(x => x.JobType)
+                .OrderBy(x => x.Key)
+                .Select(x => $"{x.Key} x{x.Count()}"));
+            logger.LogInformation(
+                "Lease batch complete: Worker={WorkerId}; Leased=[{LeasedSummary}]",
+                worker.WorkerId,
+                leasedSummary);
+        }
+
         if (stagedWorkPausedByActiveHours && leases.Count == 0)
         {
             var queuedStagedWorkExists = await db.Jobs.AnyAsync(x =>
@@ -228,7 +259,7 @@ public sealed class JobLeaseService(
             }
         }
 
-        if (leases.Count == 0 && !response.StagedWorkPausedByActiveHours && await MissingPathChecksForQueuedWorkAsync(worker, request, mode, cancellationToken))
+        if (leases.Count == 0 && !response.StagedWorkPausedByActiveHours && await MissingPathChecksForQueuedWorkAsync(worker, request, cancellationToken))
         {
             worker.State = WorkerState.PathCheckRequired;
             await db.SaveChangesAsync(cancellationToken);
@@ -389,22 +420,11 @@ where m.Id = $mediaId";
     private static bool CanAcceptWork(WorkerControlState controlState, WorkerState workerState) =>
         controlState == WorkerControlState.Normal && (workerState == WorkerState.Online || workerState == WorkerState.PartialPathAccess);
 
-    private static bool IsJobTypeAllowedByMode(JobType jobType, ProcessingMode mode) => mode switch
-    {
-        ProcessingMode.Disabled => false,
-        ProcessingMode.ScanOnly => false,
-        ProcessingMode.ProbeOnly => jobType == JobType.Probe,
-        ProcessingMode.PlanOnly => jobType == JobType.Probe,
-        ProcessingMode.PlanAndReview => jobType is JobType.Probe or JobType.PlanReview,
-        ProcessingMode.TranscodeToStaging => true,
-        ProcessingMode.ReplaceApproved => true,
-        _ => false
-    };
-
-    private async Task<bool> MissingPathChecksForQueuedWorkAsync(WorkerEntity worker, LeaseBatchRequest request, ProcessingMode mode, CancellationToken cancellationToken)
+    private async Task<bool> MissingPathChecksForQueuedWorkAsync(WorkerEntity worker, LeaseBatchRequest request, CancellationToken cancellationToken)
     {
         var requestedTypes = request.Requests
-            .Where(x => x.MaxJobs > 0 && IsJobTypeAllowedByMode(x.JobType, mode))
+            .Where(x => x.MaxJobs > 0
+                && WorkerHasRole(worker.Roles, x.JobType))
             .Select(x => x.JobType)
             .ToList();
 
