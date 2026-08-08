@@ -8,7 +8,12 @@ using Transcoder.Server.Options;
 
 namespace Transcoder.Server.Services;
 
-public sealed class JobCompletionService(TranscoderDbContext db, IOptions<WorkerTimingOptions> timingOptions, TranscodePlanService planner, SystemSettingsService settings)
+public sealed class JobCompletionService(
+    TranscoderDbContext db,
+    IOptions<WorkerTimingOptions> timingOptions,
+    TranscodePlanService planner,
+    SystemSettingsService settings,
+    ILogger<JobCompletionService> logger)
 {
     public async Task<bool> ProgressAsync(long jobId, JobProgressRequest request, CancellationToken cancellationToken = default)
     {
@@ -186,7 +191,16 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         // A worker may time out after CompleteAsync has already committed success. Never let
         // a late failure callback undo a completed/staged/replaced job.
         if (job.Status == JobStatus.Completed)
+        {
+            logger.LogWarning(
+                "Late failure ignored for completed job: JobId={JobId}; Type={JobType}; Worker={WorkerId}; ErrorCode={ErrorCode}; Message={Message}",
+                job.Id,
+                job.JobType,
+                failingWorkerId,
+                request.ErrorCode,
+                request.Message);
             return true;
+        }
 
         job.LastError = $"{request.ErrorCode}: {request.Message}";
         job.LastMessage = request.Details;
@@ -197,6 +211,13 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         {
             await HandleInvalidStreamMapFailureAsync(job, request, cancellationToken);
             await db.SaveChangesAsync(cancellationToken);
+            logger.LogWarning(
+                "Job failed with invalid stream map and recovery was triggered: JobId={JobId}; Type={JobType}; Worker={WorkerId}; MediaItemId={MediaItemId}; Error={Error}",
+                job.Id,
+                job.JobType,
+                failingWorkerId,
+                job.MediaItemId,
+                job.LastError);
             return true;
         }
 
@@ -218,6 +239,18 @@ public sealed class JobCompletionService(TranscoderDbContext db, IOptions<Worker
         }
 
         await db.SaveChangesAsync(cancellationToken);
+
+        logger.LogWarning(
+            "Job failed: JobId={JobId}; Type={JobType}; Worker={WorkerId}; MediaItemId={MediaItemId}; Attempt={AttemptNumber}/{MaxAttempts}; NewStatus={NewStatus}; Error={Error}",
+            job.Id,
+            job.JobType,
+            failingWorkerId,
+            job.MediaItemId,
+            job.AttemptNumber,
+            job.MaxAttempts,
+            job.Status,
+            job.LastError);
+
         return true;
     }
 

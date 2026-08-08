@@ -19,7 +19,8 @@ public sealed class WorkersController(
     SystemSettingsService settings,
     IOptions<WorkerTimingOptions> timingOptions,
     IOptions<TranscoderServerOptions> serverOptions,
-    IOptions<WorkerRequirementOptions> requirementOptions) : ControllerBase
+    IOptions<WorkerRequirementOptions> requirementOptions,
+    ILogger<WorkersController> logger) : ControllerBase
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -32,6 +33,8 @@ public sealed class WorkersController(
         var worker = await db.Workers.FirstOrDefaultAsync(x => x.WorkerId == request.WorkerId, cancellationToken);
         var now = DateTime.UtcNow;
         var isNew = worker is null;
+        var previousState = worker?.State;
+        var previousInstanceId = worker?.WorkerInstanceId;
 
         worker ??= new WorkerEntity { WorkerId = request.WorkerId, RegisteredUtc = now };
         worker.WorkerName = request.WorkerName;
@@ -53,6 +56,15 @@ public sealed class WorkersController(
             worker.ControlState = WorkerControlState.Disabled;
             if (isNew) db.Workers.Add(worker);
             await db.SaveChangesAsync(cancellationToken);
+
+            logger.LogWarning(
+                "Worker registration rejected: Worker={WorkerId}; Name={WorkerName}; Instance={WorkerInstanceId}; Version={WorkerVersion}; Roles={Roles}; Errors={Errors}",
+                request.WorkerId,
+                request.WorkerName,
+                request.WorkerInstanceId,
+                request.WorkerVersion,
+                request.Roles,
+                string.Join("; ", requirementErrors));
 
             var timingForRejected = timingOptions.Value;
             return new WorkerRegisterResponse
@@ -76,6 +88,25 @@ public sealed class WorkersController(
         worker.State = WorkerState.PathCheckRequired;
         if (isNew) db.Workers.Add(worker);
         await db.SaveChangesAsync(cancellationToken);
+
+        var connectionKind = isNew
+            ? "connected"
+            : !string.Equals(previousInstanceId, request.WorkerInstanceId, StringComparison.Ordinal)
+                ? "reconnected with new instance"
+                : "re-registered";
+
+        logger.LogInformation(
+            "Worker {ConnectionKind}: Worker={WorkerId}; Name={WorkerName}; Instance={WorkerInstanceId}; Version={WorkerVersion}; Roles={Roles}; PreviousState={PreviousState}; CPU={AllowCpu}; GPU={AllowGpu}; Encoders=[{Encoders}]",
+            connectionKind,
+            request.WorkerId,
+            request.WorkerName,
+            request.WorkerInstanceId,
+            request.WorkerVersion,
+            request.Roles,
+            previousState?.ToString() ?? "(new)",
+            request.Capabilities.AllowCpuEncoding,
+            request.Capabilities.AllowGpuEncoding,
+            string.Join(", ", request.Capabilities.Encoders));
 
         var timing = timingOptions.Value;
         return new WorkerRegisterResponse
@@ -131,6 +162,27 @@ public sealed class WorkersController(
                 : WorkerState.PathCheckFailed;
         worker.LastSeenUtc = DateTime.UtcNow;
         await db.SaveChangesAsync(cancellationToken);
+
+        var failedChecks = request.Results.Where(x => !x.Success).ToList();
+        if (failedChecks.Count == 0)
+        {
+            logger.LogInformation(
+                "Worker path checks passed: Worker={WorkerId}; Checks={CheckCount}; State={WorkerState}",
+                workerId,
+                request.Results.Count(),
+                worker.State);
+        }
+        else
+        {
+            logger.LogWarning(
+                "Worker path checks completed with failures: Worker={WorkerId}; Passed={Passed}; Failed={Failed}; State={WorkerState}; Failures={Failures}",
+                workerId,
+                request.Results.Count() - failedChecks.Count,
+                failedChecks.Count,
+                worker.State,
+                string.Join("; ", failedChecks.Select(x => $"{x.Id}: {x.Error ?? "failed"}")));
+        }
+
         return NoContent();
     }
 
@@ -140,6 +192,7 @@ public sealed class WorkersController(
         var worker = await db.Workers.FirstOrDefaultAsync(x => x.WorkerId == workerId, cancellationToken);
         if (worker is null) return NotFound();
 
+        var stateBeforeHeartbeat = worker.State;
         worker.WorkerInstanceId = request.WorkerInstanceId;
         var now = DateTime.UtcNow;
         worker.LastSeenUtc = now;
@@ -158,6 +211,17 @@ public sealed class WorkersController(
         }
 
         await db.SaveChangesAsync(cancellationToken);
+
+        if (stateBeforeHeartbeat is WorkerState.Lost or WorkerState.Unresponsive
+            && worker.State is WorkerState.Online or WorkerState.PartialPathAccess)
+        {
+            logger.LogInformation(
+                "Worker reconnected: Worker={WorkerId}; Instance={WorkerInstanceId}; PreviousState={PreviousState}; State={WorkerState}",
+                worker.WorkerId,
+                request.WorkerInstanceId,
+                stateBeforeHeartbeat,
+                worker.State);
+        }
 
         var response = new WorkerHeartbeatResponse
         {

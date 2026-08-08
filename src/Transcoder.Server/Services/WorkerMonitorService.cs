@@ -39,9 +39,20 @@ public sealed class WorkerMonitorService(IServiceProvider services, IOptions<Wor
 
         foreach (var worker in workers)
         {
+            var previousState = worker.State;
+
             if (worker.ControlState == WorkerControlState.Disabled)
             {
                 worker.State = WorkerState.Disabled;
+                if (previousState != worker.State)
+                {
+                    logger.LogInformation(
+                        "Worker state changed: Worker={WorkerId}; {PreviousState} -> {WorkerState}; Control={ControlState}",
+                        worker.WorkerId,
+                        previousState,
+                        worker.State,
+                        worker.ControlState);
+                }
                 continue;
             }
 
@@ -59,6 +70,38 @@ public sealed class WorkerMonitorService(IServiceProvider services, IOptions<Wor
                 _ when worker.ControlState != WorkerControlState.Normal => WorkerState.Draining,
                 _ => WorkerState.Online
             };
+
+            if (worker.State != previousState)
+            {
+                if (worker.State == WorkerState.Lost)
+                {
+                    logger.LogWarning(
+                        "Worker disconnected/lost: Worker={WorkerId}; Name={WorkerName}; LastSeenUtc={LastSeenUtc}; AgeSeconds={AgeSeconds:F0}",
+                        worker.WorkerId,
+                        worker.WorkerName,
+                        worker.LastSeenUtc,
+                        age.TotalSeconds);
+                }
+                else if (worker.State == WorkerState.Unresponsive)
+                {
+                    logger.LogWarning(
+                        "Worker unresponsive: Worker={WorkerId}; Name={WorkerName}; LastSeenUtc={LastSeenUtc}; AgeSeconds={AgeSeconds:F0}",
+                        worker.WorkerId,
+                        worker.WorkerName,
+                        worker.LastSeenUtc,
+                        age.TotalSeconds);
+                }
+                else
+                {
+                    logger.LogInformation(
+                        "Worker state changed: Worker={WorkerId}; {PreviousState} -> {WorkerState}; AgeSeconds={AgeSeconds:F0}; Control={ControlState}",
+                        worker.WorkerId,
+                        previousState,
+                        worker.State,
+                        age.TotalSeconds,
+                        worker.ControlState);
+                }
+            }
         }
 
         var expiredJobs = await db.Jobs
@@ -67,6 +110,9 @@ public sealed class WorkerMonitorService(IServiceProvider services, IOptions<Wor
 
         foreach (var job in expiredJobs)
         {
+            var expiredWorkerId = job.LeasedByWorkerId;
+            var expiredLeaseId = job.LeaseId;
+
             job.LastError = "Worker lease expired; job requeued.";
             job.LastLeaseId = job.LeaseId;
             job.LeaseId = null;
@@ -77,6 +123,16 @@ public sealed class WorkerMonitorService(IServiceProvider services, IOptions<Wor
             job.LeaseExpiresUtc = null;
             job.Progress = null;
             job.Status = job.AttemptNumber >= job.MaxAttempts ? JobStatus.Failed : JobStatus.Queued;
+
+            logger.LogWarning(
+                "Job lease expired: JobId={JobId}; Type={JobType}; Worker={WorkerId}; LeaseId={LeaseId}; Attempt={AttemptNumber}/{MaxAttempts}; NewStatus={NewStatus}",
+                job.Id,
+                job.JobType,
+                expiredWorkerId,
+                expiredLeaseId,
+                job.AttemptNumber,
+                job.MaxAttempts,
+                job.Status);
         }
 
         await db.SaveChangesAsync(cancellationToken);

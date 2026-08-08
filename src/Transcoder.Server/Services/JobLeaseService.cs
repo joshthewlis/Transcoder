@@ -15,7 +15,8 @@ public sealed class JobLeaseService(
     SystemSettingsService settings,
     PathCheckDefinitionService pathChecks,
     IOptions<WorkerTimingOptions> timingOptions,
-    IOptions<TranscoderServerOptions> serverOptions)
+    IOptions<TranscoderServerOptions> serverOptions,
+    ILogger<JobLeaseService> logger)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -27,6 +28,11 @@ public sealed class JobLeaseService(
         var worker = await db.Workers.FirstOrDefaultAsync(x => x.WorkerId == request.WorkerId, cancellationToken);
         if (worker is null)
         {
+            logger.LogWarning(
+                "Lease request rejected for unknown worker {WorkerId} instance {WorkerInstanceId}",
+                request.WorkerId,
+                request.WorkerInstanceId);
+
             return new JobLeaseBatchResponse
             {
                 RetryAfterSeconds = serverOptions.Value.PollSeconds,
@@ -43,6 +49,20 @@ public sealed class JobLeaseService(
         var execution = await settings.GetExecutionSettingsAsync(cancellationToken);
         var activeHours = ActiveHoursEvaluator.Evaluate(execution, DateTime.UtcNow);
         response.ActiveHours = activeHours;
+
+        var requestedWork = string.Join(", ", request.Requests
+            .Where(x => x.MaxJobs > 0)
+            .Select(x => $"{x.JobType} x{x.MaxJobs}"));
+
+        logger.LogDebug(
+            "Worker {WorkerId} asks for jobs. Instance={WorkerInstanceId}; Requests=[{Requests}]; State={WorkerState}; Control={ControlState}; Mode={ProcessingMode}",
+            worker.WorkerId,
+            request.WorkerInstanceId,
+            requestedWork,
+            worker.State,
+            worker.ControlState,
+            mode);
+
         if (worker.State == WorkerState.PathCheckRequired)
         {
             response.AcceptNewWork = false;
@@ -52,6 +72,10 @@ public sealed class JobLeaseService(
             response.PathCheckRequired = true;
             response.PathChecks = await pathChecks.BuildPathChecksAsync(cancellationToken);
             response.Message = "Worker path checks are required before leasing more jobs.";
+            logger.LogInformation(
+                "Worker {WorkerId} could not lease work: path checks are required. ServerHasAnyWork={ServerHasAnyWork}",
+                worker.WorkerId,
+                response.ServerHasAnyWork);
             return response;
         }
 
@@ -60,10 +84,19 @@ public sealed class JobLeaseService(
             response.QueueEmptyForWorker = true;
             response.ServerHasAnyWork = await db.Jobs.AnyAsync(x => x.Status == JobStatus.Queued, cancellationToken);
             response.ServerHasWorkForThisWorker = false;
+            logger.LogInformation(
+                "Worker {WorkerId} could not lease work: State={WorkerState}; Control={ControlState}; ProcessingMode={ProcessingMode}; ServerHasAnyWork={ServerHasAnyWork}",
+                worker.WorkerId,
+                worker.State,
+                worker.ControlState,
+                mode,
+                response.ServerHasAnyWork);
             return response;
         }
 
         var leases = new List<JobLeaseDto>();
+        var rejectionReasons = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var queuedCandidatesSeen = 0;
         var now = DateTime.UtcNow;
         var timing = timingOptions.Value;
         var workerLimits = DeserializeWorkerLimits(worker.LimitsJson);
@@ -82,11 +115,15 @@ public sealed class JobLeaseService(
         foreach (var item in request.Requests.Where(x => x.MaxJobs > 0))
         {
             if (!IsJobTypeAllowedByMode(item.JobType, mode))
+            {
+                AddRejection(rejectionReasons, $"{item.JobType}: processing mode {mode} does not allow this job type");
                 continue;
+            }
 
             if (ActiveHoursEvaluator.AppliesToJobType(item.JobType) && !activeHours.AllowStagedWork)
             {
                 stagedWorkPausedByActiveHours = true;
+                AddRejection(rejectionReasons, $"{item.JobType}: outside configured active hours");
                 continue;
             }
 
@@ -100,11 +137,20 @@ public sealed class JobLeaseService(
                 .ThenBy(j => j.CreatedUtc)
                 .ToList();
 
+            queuedCandidatesSeen += candidates.Count;
+            if (candidates.Count == 0)
+                AddRejection(rejectionReasons, $"{item.JobType}: no queued jobs");
+
             if (item.JobType is JobType.Cleanup or JobType.Transcode)
             {
                 var storageSettings = await settings.GetStorageRuntimeSettingsAsync(cancellationToken);
                 if (storageSettings.StorageAwareScheduling)
+                {
+                    var beforeStorageScheduling = candidates.Count;
                     candidates = await OrderCandidatesByStorageAsync(candidates, storageSettings, cancellationToken);
+                    if (beforeStorageScheduling > 0 && candidates.Count == 0)
+                        AddRejection(rejectionReasons, $"{item.JobType}: storage-aware scheduling currently has no available source slot");
+                }
             }
 
             foreach (var job in candidates)
@@ -113,13 +159,23 @@ public sealed class JobLeaseService(
                     break;
 
                 if (item.JobType == JobType.Cleanup && activeCleanupJobs + leases.Count(x => x.JobType == JobType.Cleanup) >= workerLimits.MaxCleanupJobs)
+                {
+                    AddRejection(rejectionReasons, $"Cleanup: worker capacity reached ({activeCleanupJobs}/{workerLimits.MaxCleanupJobs})");
                     break;
+                }
 
                 if (item.JobType == JobType.Transcode && activeTranscodeJobs + leases.Count(x => x.JobType == JobType.Transcode) >= workerLimits.MaxTranscodeJobs)
+                {
+                    AddRejection(rejectionReasons, $"Transcode: worker capacity reached ({activeTranscodeJobs}/{workerLimits.MaxTranscodeJobs})");
                     break;
+                }
 
-                if (!WorkerCanRunJob(worker, request.Capabilities, job))
+                var rejectionReason = GetWorkerJobRejectionReason(worker, request.Capabilities, job);
+                if (rejectionReason is not null)
+                {
+                    AddRejection(rejectionReasons, $"{job.JobType}: {rejectionReason}");
                     continue;
+                }
 
                 var leaseId = Guid.NewGuid().ToString("N");
                 job.Status = JobStatus.Leased;
@@ -140,6 +196,15 @@ public sealed class JobLeaseService(
                     LeaseExpiresUtc = job.LeaseExpiresUtc.Value,
                     Payload = JsonSerializer.Deserialize<System.Text.Json.JsonElement>(job.PayloadJson, JsonOptions)
                 });
+
+                logger.LogInformation(
+                    "Job leased: JobId={JobId}; Type={JobType}; Worker={WorkerId}; Instance={WorkerInstanceId}; Attempt={AttemptNumber}; RequiredEncoder={RequiredEncoder}",
+                    job.Id,
+                    job.JobType,
+                    worker.WorkerId,
+                    request.WorkerInstanceId,
+                    job.AttemptNumber,
+                    job.RequiredEncoder ?? "(none)");
             }
         }
 
@@ -171,6 +236,29 @@ public sealed class JobLeaseService(
             response.PathCheckRequired = true;
             response.PathChecks = await pathChecks.BuildPathChecksAsync(cancellationToken);
             response.Message = "Queued work exists, but this worker is missing path-check results for one or more libraries.";
+            AddRejection(rejectionReasons, "missing current path-check results for one or more queued libraries");
+        }
+
+        if (leases.Count == 0)
+        {
+            if (response.ServerHasAnyWork)
+            {
+                var reasonSummary = rejectionReasons.Count == 0
+                    ? "queued work exists, but no eligible candidate was found in this worker's requested job types"
+                    : string.Join("; ", rejectionReasons
+                        .OrderByDescending(x => x.Value)
+                        .Select(x => $"{x.Key} ({x.Value})"));
+
+                logger.LogInformation(
+                    "Worker {WorkerId} asked for jobs but could not lease one. CandidatesSeen={CandidatesSeen}; Reasons: {Reasons}",
+                    worker.WorkerId,
+                    queuedCandidatesSeen,
+                    reasonSummary);
+            }
+            else
+            {
+                logger.LogDebug("Worker {WorkerId} asked for jobs; queue is empty.", worker.WorkerId);
+            }
         }
 
         return response;
@@ -344,16 +432,22 @@ where m.Id = $mediaId";
         return false;
     }
 
-    private bool WorkerCanRunJob(WorkerEntity worker, WorkerCapabilitiesDto capabilities, JobEntity job)
+    private string? GetWorkerJobRejectionReason(WorkerEntity worker, WorkerCapabilitiesDto capabilities, JobEntity job)
     {
         if (!WorkerHasRole(worker.Roles, job.JobType))
-            return false;
+            return $"worker does not advertise required role for {job.JobType}; Roles={worker.Roles}";
 
-        if (job.JobType == JobType.Transcode && !WorkerCanSatisfyTranscodeRequirement(capabilities, job))
-            return false;
-
-        if (job.JobType != JobType.Transcode && !string.IsNullOrWhiteSpace(job.RequiredEncoder) && !capabilities.Encoders.Contains(job.RequiredEncoder, StringComparer.OrdinalIgnoreCase))
-            return false;
+        if (job.JobType == JobType.Transcode)
+        {
+            var transcodeReason = GetTranscodeRequirementRejectionReason(capabilities, job);
+            if (transcodeReason is not null)
+                return transcodeReason;
+        }
+        else if (!string.IsNullOrWhiteSpace(job.RequiredEncoder)
+                 && !capabilities.Encoders.Contains(job.RequiredEncoder, StringComparer.OrdinalIgnoreCase))
+        {
+            return $"required encoder '{job.RequiredEncoder}' is not advertised; Encoders=[{string.Join(", ", capabilities.Encoders)}]";
+        }
 
         if (job.LibraryId is not null)
         {
@@ -366,28 +460,135 @@ where m.Id = $mediaId";
                 && x.CanRead);
 
             if (!hasLibraryAccess)
-                return false;
+                return $"library {job.LibraryId} read path has not passed its current path check";
         }
 
         if (job.JobType is JobType.Probe or JobType.PlanReview)
-            return true;
+            return null;
 
-        var hasStagingAccess = db.WorkerPathChecks.AsNoTracking().Any(x =>
-            x.WorkerId == worker.WorkerId
-            && x.MappingConfigHash == worker.MappingConfigHash
-            && x.CheckId == "transcoder-staging"
-            && x.Success
-            && (job.JobType == JobType.ValidateOutput ? x.CanRead : x.CanWrite));
+        var stagingCheck = db.WorkerPathChecks.AsNoTracking()
+            .Where(x =>
+                x.WorkerId == worker.WorkerId
+                && x.MappingConfigHash == worker.MappingConfigHash
+                && x.CheckId == "transcoder-staging")
+            .OrderByDescending(x => x.CheckedUtc)
+            .FirstOrDefault();
+
+        if (stagingCheck is null)
+            return "staging path has no current path-check result";
+
+        if (!stagingCheck.Success)
+            return $"staging path check failed{FormatCheckError(stagingCheck.Error)}";
+
+        if (job.JobType == JobType.ValidateOutput)
+            return stagingCheck.CanRead ? null : "staging path is not readable";
+
+        if (!stagingCheck.CanWrite)
+            return "staging path is not writable";
+
+        if (job.JobType is JobType.Cleanup or JobType.Transcode)
+        {
+            var localReason = GetLocalWorkingAccessRejectionReason(worker);
+            if (localReason is not null)
+                return localReason;
+        }
 
         return job.JobType switch
         {
-            JobType.Cleanup => hasStagingAccess && WorkerHasLocalWorkingAccess(worker),
-            JobType.Transcode => hasStagingAccess && WorkerHasLocalWorkingAccess(worker),
-            JobType.ValidateOutput => hasStagingAccess,
-            _ => false
+            JobType.Cleanup or JobType.Transcode or JobType.ValidateOutput => null,
+            _ => $"unsupported job type {job.JobType}"
         };
     }
 
+    private static string? GetTranscodeRequirementRejectionReason(WorkerCapabilitiesDto capabilities, JobEntity job)
+    {
+        var requiredEncoder = job.RequiredEncoder;
+        var requiredEngine = ReadRequiredEncoderEngine(job.PayloadJson, requiredEncoder);
+
+        if (requiredEngine is EncoderEngine.Copy or EncoderEngine.Unknown or EncoderEngine.Either)
+        {
+            if (string.IsNullOrWhiteSpace(requiredEncoder)
+                || capabilities.Encoders.Contains(requiredEncoder, StringComparer.OrdinalIgnoreCase))
+                return null;
+
+            return $"required encoder '{requiredEncoder}' is not advertised; Encoders=[{string.Join(", ", capabilities.Encoders)}]";
+        }
+
+        if (requiredEngine == EncoderEngine.Cpu)
+        {
+            if (!capabilities.AllowCpuEncoding)
+                return $"job requires CPU encoding ({requiredEncoder ?? "any CPU encoder"}) but CPU encoding is disabled";
+
+            if (string.IsNullOrWhiteSpace(requiredEncoder))
+                return capabilities.CpuEncoders.Count > 0
+                    ? null
+                    : "job requires CPU encoding but worker advertises no CPU encoders";
+
+            var supported = capabilities.CpuEncoders.Contains(requiredEncoder, StringComparer.OrdinalIgnoreCase)
+                || (capabilities.CpuEncoders.Count == 0
+                    && capabilities.Encoders.Contains(requiredEncoder, StringComparer.OrdinalIgnoreCase)
+                    && InferEncoderEngine(requiredEncoder) == EncoderEngine.Cpu);
+
+            return supported
+                ? null
+                : $"required CPU encoder '{requiredEncoder}' is unavailable; CpuEncoders=[{string.Join(", ", capabilities.CpuEncoders)}]";
+        }
+
+        if (requiredEngine == EncoderEngine.Gpu)
+        {
+            if (!capabilities.AllowGpuEncoding)
+                return $"job requires GPU encoding ({requiredEncoder ?? "any GPU encoder"}) but GPU encoding is disabled";
+
+            if (string.IsNullOrWhiteSpace(requiredEncoder))
+                return capabilities.GpuEncoders.Count > 0
+                    ? null
+                    : "job requires GPU encoding but worker advertises no GPU encoders";
+
+            var supported = capabilities.GpuEncoders.Contains(requiredEncoder, StringComparer.OrdinalIgnoreCase)
+                || (capabilities.GpuEncoders.Count == 0
+                    && capabilities.Encoders.Contains(requiredEncoder, StringComparer.OrdinalIgnoreCase)
+                    && InferEncoderEngine(requiredEncoder) == EncoderEngine.Gpu);
+
+            return supported
+                ? null
+                : $"required GPU encoder '{requiredEncoder}' is unavailable; GpuEncoders=[{string.Join(", ", capabilities.GpuEncoders)}]";
+        }
+
+        return $"unrecognized required encoder engine '{requiredEngine}'";
+    }
+
+    private static string? GetLocalWorkingAccessRejectionReason(WorkerEntity worker)
+    {
+        try
+        {
+            var localStorage = JsonSerializer.Deserialize<WorkerLocalStorageDto>(worker.LocalStorageJson, JsonOptions);
+            if (localStorage is null)
+                return "worker did not report local-working storage";
+
+            if (!localStorage.LocalWorkingRootExists)
+                return "local-working root does not exist";
+
+            if (!localStorage.LocalWorkingRootWritable)
+                return "local-working root is not writable";
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"worker local-storage report could not be read ({ex.GetType().Name})";
+        }
+    }
+
+    private static string FormatCheckError(string? error) =>
+        string.IsNullOrWhiteSpace(error) ? string.Empty : $": {error}";
+
+    private static void AddRejection(IDictionary<string, int> reasons, string reason)
+    {
+        if (reasons.TryGetValue(reason, out var count))
+            reasons[reason] = count + 1;
+        else
+            reasons[reason] = 1;
+    }
 
     private static bool WorkerCanSatisfyTranscodeRequirement(WorkerCapabilitiesDto capabilities, JobEntity job)
     {
