@@ -43,6 +43,16 @@ public sealed class WorkerLoopService(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _capabilities = await capabilities.DetectAsync(stoppingToken);
+        logger.LogInformation(
+            "Worker startup: WorkerId={WorkerId}; Name={WorkerName}; Instance={InstanceId}; Roles={Roles}; CPU={AllowCpu}; GPU={AllowGpu}; CpuEncoders=[{CpuEncoders}]; GpuEncoders=[{GpuEncoders}]",
+            _options.WorkerId,
+            _options.WorkerName,
+            _instanceId,
+            _options.Roles,
+            _capabilities.AllowCpuEncoding,
+            _capabilities.AllowGpuEncoding,
+            string.Join(",", _capabilities.CpuEncoders),
+            string.Join(",", _capabilities.GpuEncoders));
         var requirementErrors = capabilities.ValidateLocalRequirements(_capabilities);
         if (requirementErrors.Count > 0)
         {
@@ -65,6 +75,14 @@ public sealed class WorkerLoopService(
 
         _pollSeconds = registerResponse.PollSeconds <= 0 ? 10 : registerResponse.PollSeconds;
         _controlState = registerResponse.ControlState;
+        logger.LogInformation(
+            "Worker registered: WorkerId={WorkerId}; Instance={InstanceId}; Control={ControlState}; PollSeconds={PollSeconds}; PathCheckRequired={PathCheckRequired}; Message={Message}",
+            _options.WorkerId,
+            _instanceId,
+            _controlState,
+            _pollSeconds,
+            registerResponse.PathCheckRequired,
+            registerResponse.Message ?? "(none)");
 
         if (await ApplyRuntimeSettingsAsync(stoppingToken))
             registerResponse.PathCheckRequired = true;
@@ -500,17 +518,55 @@ public sealed class WorkerLoopService(
 
     private async Task<JobLeaseBatchResponse> RequestAndStartWorkAsync(CancellationToken cancellationToken)
     {
+        var leaseRequests = BuildLeaseRequests();
         var request = new LeaseBatchRequest
         {
             WorkerId = _options.WorkerId,
             WorkerInstanceId = _instanceId,
             Capabilities = _capabilities,
-            Requests = BuildLeaseRequests()
+            Requests = leaseRequests
         };
 
+        var requestSummary = leaseRequests.Count == 0
+            ? "(none)"
+            : string.Join(", ", leaseRequests.Select(x => $"{x.JobType} x{x.MaxJobs}"));
+        logger.LogInformation(
+            "Requesting jobs: Worker={WorkerId}; Instance={InstanceId}; Roles={Roles}; Requests=[{Requests}]; ActiveJobs={ActiveJobs}; CPU={AllowCpu}; GPU={AllowGpu}; GpuEncoders=[{GpuEncoders}]",
+            _options.WorkerId,
+            _instanceId,
+            _options.Roles,
+            requestSummary,
+            _activeJobs.Count,
+            _capabilities.AllowCpuEncoding,
+            _capabilities.AllowGpuEncoding,
+            string.Join(",", _capabilities.GpuEncoders));
+
         var response = await api.LeaseBatchAsync(request, cancellationToken);
+        var leasedSummary = response.Leases.Count == 0
+            ? "(none)"
+            : string.Join(", ", response.Leases.GroupBy(x => x.JobType).Select(g => $"{g.Key} x{g.Count()}"));
+        logger.LogInformation(
+            "Lease response: Worker={WorkerId}; Leases=[{Leases}]; AcceptNewWork={AcceptNewWork}; Control={ControlState}; QueueEmptyForWorker={QueueEmptyForWorker}; ServerHasAnyWork={ServerHasAnyWork}; ServerHasWorkForThisWorker={ServerHasWorkForThisWorker}; PathCheckRequired={PathCheckRequired}; RetryAfterSeconds={RetryAfterSeconds}; Message={Message}",
+            _options.WorkerId,
+            leasedSummary,
+            response.AcceptNewWork,
+            response.ControlState,
+            response.QueueEmptyForWorker,
+            response.ServerHasAnyWork,
+            response.ServerHasWorkForThisWorker,
+            response.PathCheckRequired,
+            response.RetryAfterSeconds,
+            response.Message ?? "(none)");
         foreach (var lease in response.Leases)
         {
+            logger.LogInformation(
+                "Lease received: Worker={WorkerId}; JobId={JobId}; Type={JobType}; LeaseId={LeaseId}; Expires={LeaseExpiresUtc:o}",
+                _options.WorkerId,
+                lease.JobId,
+                lease.JobType,
+                lease.LeaseId,
+                lease.LeaseExpiresUtc);
+
             var active = new ActiveJobState
             {
                 JobId = lease.JobId,
@@ -565,21 +621,67 @@ public sealed class WorkerLoopService(
         var stagingBacklogFull = IsStagingCopyBacklogFull();
         var localPipelineRemaining = GetLocalPipelineRemainingSlots();
 
-        var cleanupCapacity = stagingBacklogFull
-            ? 0
-            : Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup));
-        var transcodeCapacity = stagingBacklogFull
-            ? 0
-            : Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode));
+        // Only calculate capacity for roles this worker can actually run. Previously a
+        // Transcoder-only worker could have all of MaxBufferedLocalWorkItems reserved by
+        // hypothetical Cleanup capacity, leaving Transcode at zero even while completely idle.
+        var cleanupCapacity = _options.Roles.HasFlag(WorkerRole.Cleanup) && !stagingBacklogFull
+            ? Math.Max(0, _options.Limits.MaxCleanupJobs - CountActive(JobType.Cleanup))
+            : 0;
+        var transcodeCapacity = _options.Roles.HasFlag(WorkerRole.Transcoder) && !stagingBacklogFull
+            ? Math.Max(0, _options.Limits.MaxTranscodeJobs - CountActive(JobType.Transcode))
+            : 0;
 
+        // MaxBufferedLocalWorkItems is a shared local-scratch/pipeline guard. It must cap
+        // actual lease capacity, but it must not let one *potential* job type consume every
+        // slot before the server has leased anything. For mixed Cleanup+Transcoder workers,
+        // reserve one slot for Transcode (when possible), then give Cleanup the remaining
+        // slots, then any leftover capacity back to Transcode. SourceCopy/ StagingCopy
+        // MaxConcurrentCopies remain the controls that serialize NAS reads/writes.
         if (_options.SourceCopy.Enabled && localPipelineRemaining >= 0)
         {
-            var cleanupLeaseSlots = Math.Min(cleanupCapacity, localPipelineRemaining);
-            localPipelineRemaining -= cleanupLeaseSlots;
+            var remaining = localPipelineRemaining;
+            var cleanupWanted = cleanupCapacity;
+            var transcodeWanted = transcodeCapacity;
 
-            cleanupCapacity = cleanupLeaseSlots;
-            transcodeCapacity = Math.Min(transcodeCapacity, Math.Max(0, localPipelineRemaining));
+            cleanupCapacity = 0;
+            transcodeCapacity = 0;
+
+            if (remaining > 0 && cleanupWanted > 0 && transcodeWanted > 0)
+            {
+                // Ensure a mixed worker can still request Transcode work instead of Cleanup
+                // consuming the whole shared buffer on paper.
+                transcodeCapacity = 1;
+                transcodeWanted--;
+                remaining--;
+            }
+
+            if (remaining > 0 && cleanupWanted > 0)
+            {
+                var slots = Math.Min(cleanupWanted, remaining);
+                cleanupCapacity += slots;
+                remaining -= slots;
+            }
+
+            if (remaining > 0 && transcodeWanted > 0)
+            {
+                var slots = Math.Min(transcodeWanted, remaining);
+                transcodeCapacity += slots;
+                remaining -= slots;
+            }
         }
+
+        logger.LogInformation(
+            "Worker capacity: Worker={WorkerId}; ActiveCleanup={ActiveCleanup}; ActiveTranscode={ActiveTranscode}; LocalPipelineRemaining={LocalPipelineRemaining}; StagingBacklog={StagingBacklog}/{MaxStagingBacklog}; CleanupCapacity={CleanupCapacity}; TranscodeCapacity={TranscodeCapacity}; SourceCopies={SourceCopies}; StagingCopies={StagingCopies}",
+            _options.WorkerId,
+            CountActive(JobType.Cleanup),
+            CountActive(JobType.Transcode),
+            localPipelineRemaining,
+            CountStagingCopyBacklog(),
+            _options.StagingCopy.MaxBufferedLocalOutputs,
+            cleanupCapacity,
+            transcodeCapacity,
+            _options.SourceCopy.MaxConcurrentCopies,
+            _options.StagingCopy.MaxConcurrentCopies);
 
         return new WorkerCapacityDto
         {
