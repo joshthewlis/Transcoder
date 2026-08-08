@@ -188,6 +188,8 @@ public sealed class JobCompletionService(
         if (job is null || job.LeaseId != request.LeaseId)
             return false;
 
+        var failingWorkerId = job.LeasedByWorkerId ?? "unknown";
+
         // A worker may time out after CompleteAsync has already committed success. Never let
         // a late failure callback undo a completed/staged/replaced job.
         if (job.Status == JobStatus.Completed)
