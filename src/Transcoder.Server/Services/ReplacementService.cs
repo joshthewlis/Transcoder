@@ -58,6 +58,59 @@ public sealed class ReplacementService(
         if (Math.Abs((originalInfo.LastWriteTimeUtc - media.LastModifiedUtc).TotalSeconds) > 5)
             return Reject(media.Id, "Original modified time changed since planning. Re-scan/re-probe before replacing.", media.Status);
 
+        var wasCleanup = media.Status == MediaStatus.StagedCleaned || stats.LastCompletedWorkType == JobType.Cleanup;
+        if (stagedInfo.Length >= originalInfo.Length)
+        {
+            var differenceBytes = stagedInfo.Length - originalInfo.Length;
+            var attemptedWorkType = stats.LastCompletedWorkType ?? (wasCleanup ? JobType.Cleanup : JobType.Transcode);
+            logger.LogWarning(
+                "Replacement skipped because {WorkType} output is not smaller: MediaId={MediaId}; OriginalBytes={OriginalBytes}; StagedBytes={StagedBytes}; DifferenceBytes={DifferenceBytes}; Original retained",
+                attemptedWorkType, media.Id, originalInfo.Length, stagedInfo.Length, differenceBytes);
+
+            MediaProcessingStatsStore.AddHistory(stats, new ProcessingHistoryEntry
+            {
+                Stage = wasCleanup ? "CleanupNotBeneficial" : "TranscodeNotBeneficial",
+                JobType = attemptedWorkType,
+                CompletedUtc = DateTime.UtcNow,
+                BeforeSizeBytes = originalInfo.Length,
+                AfterSizeBytes = stagedInfo.Length,
+                SavedBytes = 0,
+                TotalSavedBytes = stats.TotalSavedBytes,
+                InputPath = media.FullPath,
+                OutputPath = stagingPath,
+                Message = $"Staged output was {differenceBytes} byte(s) larger than or equal to the current library file. Replacement was skipped and the original was retained."
+            });
+
+            // Preserve completed savings/history; only clear the rejected staged artifact state.
+            stats.StagingTransferComplete = false;
+            stats.StagingOutputPath = null;
+            stats.StagingCompleteMarkerPath = null;
+            MediaProcessingStatsStore.Write(media, stats);
+
+            TryDelete(stagingPath);
+            TryDelete(markerPath);
+            TryDeleteEmptyDirectories(Path.GetDirectoryName(stagingPath), storageOptions.Value.StagingRoot);
+
+            media.StagingPath = null;
+            media.Status = MediaStatus.Skipped;
+            media.UpdatedUtc = DateTime.UtcNow;
+            await db.SaveChangesAsync(cancellationToken);
+
+            return new ReplaceMediaResultDto
+            {
+                MediaId = media.Id,
+                Accepted = true,
+                Replaced = false,
+                Message = $"Replacement skipped: staged {attemptedWorkType} output is not smaller than the current file ({stagedInfo.Length} >= {originalInfo.Length} bytes). Original retained.",
+                MediaStatus = media.Status,
+                OriginalPath = media.FullPath,
+                StagingPath = stagingPath,
+                OriginalSizeBytes = stats.OriginalSizeBytes ?? originalInfo.Length,
+                ReplacementSizeBytes = stagedInfo.Length,
+                TotalSavedBytes = stats.TotalSavedBytes
+            };
+        }
+
         var keepOriginalsQuarantine = storageOptions.Value.KeepOriginalsQuarantine;
         var backupPath = keepOriginalsQuarantine
             ? BuildBackupPath(media.Library, media)
@@ -71,7 +124,6 @@ public sealed class ReplacementService(
             backupPath);
 
         var originalPath = media.FullPath;
-        var wasCleanup = media.Status == MediaStatus.StagedCleaned || stats.LastCompletedWorkType == JobType.Cleanup;
         try
         {
             MoveFile(originalPath, backupPath, overwrite: false);

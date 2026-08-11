@@ -1173,7 +1173,17 @@ public sealed class TranscodePlanService(
 
         var selectedSubtitleIds = selectedSubtitles.Select(x => x.Index).ToHashSet();
         foreach (var sub in selectedSubtitles)
+        {
+            if (!CanCopySubtitleToOutputContainer(sub.CodecName, plan.StagingOutputPath))
+            {
+                var codecName = string.IsNullOrWhiteSpace(sub.CodecName) ? "unknown" : sub.CodecName;
+                streamPlans.Add(ToStreamPlan(sub, "Remove", $"Subtitle codec '{codecName}' cannot be copied into the {Path.GetExtension(plan.StagingOutputPath)} output container"));
+                warnings.Add($"Subtitle stream {sub.Index} ({codecName}{(string.IsNullOrWhiteSpace(sub.Language) ? string.Empty : $", {sub.Language}")}) was selected by policy but will be omitted because the output container cannot mux that codec. The original file remains protected by staged replacement safeguards.");
+                continue;
+            }
+
             streamPlans.Add(ToStreamPlan(sub, "Copy", sub.Forced ? "Forced subtitle kept by policy" : "Language matches subtitle policy"));
+        }
         foreach (var sub in subtitleStreams.Where(x => !selectedSubtitleIds.Contains(x.Index)))
             streamPlans.Add(ToStreamPlan(sub, "Remove", "Subtitle does not match keep policy"));
 
@@ -1259,6 +1269,21 @@ public sealed class TranscodePlanService(
 
     private static bool IsKeptOutputStream(StreamPlanDto stream) =>
         (stream.Action == "Copy" || stream.Action == "Transcode") && stream.StreamType != "attachment";
+
+    private static bool CanCopySubtitleToOutputContainer(string? codecName, string outputPath)
+    {
+        var extension = Path.GetExtension(outputPath);
+        if (extension is null ||
+            (!extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase) &&
+             !extension.Equals(".m4v", StringComparison.OrdinalIgnoreCase) &&
+             !extension.Equals(".mov", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var codec = (codecName ?? string.Empty).Trim().ToLowerInvariant();
+        return codec is not ("eia_608" or "eia608" or "c608" or "eia_708" or "eia708" or "c708");
+    }
 
     private static void ApplySavingsEstimate(TranscodePlanDto plan)
     {
