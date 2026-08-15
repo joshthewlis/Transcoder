@@ -144,7 +144,8 @@ public enum MediaStatus
     StagedCleaned = 14,
     ReplacedCleaned = 15,
     ReplacedTranscoded = 16,
-    ReplaceFailed = 17
+    ReplaceFailed = 17,
+    Missing = 18
 }
 
 public enum ReviewType

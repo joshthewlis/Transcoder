@@ -793,6 +793,9 @@ public sealed class WorkerLoopService(
 
     private static string GetFailureCode(Exception ex)
     {
+        if (ex is SourceMediaMissingException)
+            return "SourceMediaMissing";
+
         if (ex is FfmpegException ffmpegException && !string.IsNullOrWhiteSpace(ffmpegException.ErrorCode))
             return ffmpegException.ErrorCode;
 
@@ -806,6 +809,7 @@ public sealed class WorkerLoopService(
         logger.LogInformation("Probe started for {Path}", inputPath);
         if (!pathMapper.TryMap(inputPath, out var localPath))
             throw new InvalidOperationException($"No path mapping found for {inputPath}");
+        EnsureSourceMediaExists(inputPath, localPath);
 
         var probeJson = await ffprobe.ProbeAsync(localPath, cancellationToken);
         var result = JsonSerializer.SerializeToElement(new
@@ -833,6 +837,7 @@ public sealed class WorkerLoopService(
         logger.LogInformation("Plan review started for {Path}", inputPath);
         if (!pathMapper.TryMap(inputPath, out var localPath))
             throw new InvalidOperationException($"No path mapping found for {inputPath}");
+        EnsureSourceMediaExists(inputPath, localPath);
 
         var probeJson = await ffprobe.ProbeAsync(localPath, cancellationToken);
         using var probeDocument = JsonDocument.Parse(probeJson);
@@ -917,6 +922,7 @@ public sealed class WorkerLoopService(
             throw new InvalidOperationException($"No path mapping found for input path {inputPath}");
         if (!pathMapper.TryMap(stagingOutputPath, out var localStagingOutputPath))
             throw new InvalidOperationException($"No path mapping found for staging path {stagingOutputPath}");
+        EnsureSourceMediaExists(inputPath, localInputPath);
 
         var ffmpegArgs = ReadStringArray(lease.Payload, "ffmpegArgs");
         if (ffmpegArgs.Count == 0 && lease.Payload.TryGetProperty("planJson", out var planElement))
@@ -1113,6 +1119,17 @@ public sealed class WorkerLoopService(
             _stagingCopySlots.Release();
         }
     }
+
+    private static void EnsureSourceMediaExists(string serverPath, string localPath)
+    {
+        if (!File.Exists(localPath))
+            throw new SourceMediaMissingException(serverPath, localPath);
+    }
+
+    private sealed class SourceMediaMissingException(string serverPath, string localPath)
+        : FileNotFoundException(
+            $"Source media no longer exists. ServerPath='{serverPath}', LocalPath='{localPath}'.",
+            localPath);
 
     private static async Task CopyFileAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
     {

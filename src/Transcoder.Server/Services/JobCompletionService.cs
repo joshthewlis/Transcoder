@@ -188,6 +188,8 @@ public sealed class JobCompletionService(
         if (job is null || job.LeaseId != request.LeaseId)
             return false;
 
+        // Capture the worker before any retry/requeue logic clears the lease fields so
+        // failure/recovery logs can still identify which worker reported the failure.
         var failingWorkerId = job.LeasedByWorkerId ?? "unknown";
 
         // A worker may time out after CompleteAsync has already committed success. Never let
@@ -208,6 +210,20 @@ public sealed class JobCompletionService(
         job.LastMessage = request.Details;
         job.LeaseLastSeenUtc = DateTime.UtcNow;
         job.LeaseExpiresUtc = DateTime.UtcNow.AddSeconds(timingOptions.Value.MaxLeaseSeconds);
+
+        if (IsSourceMediaMissingFailure(request))
+        {
+            await HandleSourceMediaMissingFailureAsync(job, request, failingWorkerId, cancellationToken);
+            await db.SaveChangesAsync(cancellationToken);
+            logger.LogWarning(
+                "Job terminated as non-retryable because the source media is missing: JobId={JobId}; Type={JobType}; Worker={WorkerId}; MediaItemId={MediaItemId}; Error={Error}",
+                job.Id,
+                job.JobType,
+                failingWorkerId,
+                job.MediaItemId,
+                job.LastError);
+            return true;
+        }
 
         if (IsInvalidStreamMapFailure(job, request))
         {
@@ -371,6 +387,58 @@ public sealed class JobCompletionService(
                 LastMessage = "Queued fresh probe after invalid ffmpeg stream map."
             });
         }
+    }
+
+    private static bool IsSourceMediaMissingFailure(JobFailRequest request)
+        => request.ErrorCode.Equals("SourceMediaMissing", StringComparison.OrdinalIgnoreCase);
+
+    private async Task HandleSourceMediaMissingFailureAsync(
+        JobEntity job,
+        JobFailRequest request,
+        string failingWorkerId,
+        CancellationToken cancellationToken)
+    {
+        var now = DateTime.UtcNow;
+
+        job.Status = JobStatus.Failed;
+        job.CompletedUtc = now;
+        job.Progress = null;
+        job.LastError = $"{request.ErrorCode}: {request.Message}";
+        job.LastMessage = "Source media is missing; this failure will not be retried.";
+
+        if (job.MediaItemId is null)
+            return;
+
+        // Missing rows are globally filtered from normal MediaItem queries. IgnoreQueryFilters
+        // keeps this handler idempotent if a scan/watch event marked it Missing first.
+        var media = await db.MediaItems.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(x => x.Id == job.MediaItemId.Value, cancellationToken);
+
+        if (media is null)
+            return;
+
+        media.Status = MediaStatus.Missing;
+        media.UpdatedUtc = now;
+
+        var queuedJobs = await db.Jobs
+            .Where(x => x.MediaItemId == media.Id
+                        && x.Id != job.Id
+                        && x.Status == JobStatus.Queued)
+            .ToListAsync(cancellationToken);
+
+        foreach (var queued in queuedJobs)
+        {
+            queued.Status = JobStatus.Cancelled;
+            queued.CompletedUtc = now;
+            queued.LastError = "Source media is missing.";
+            queued.LastMessage = $"Cancelled after worker {failingWorkerId} confirmed the source file does not exist.";
+        }
+
+        logger.LogWarning(
+            "Media marked Missing after worker detection: MediaItemId={MediaItemId}; Path={Path}; CancelledQueuedJobs={CancelledQueuedJobs}",
+            media.Id,
+            media.RelativePath,
+            queuedJobs.Count);
     }
 
     private static bool IsInvalidStreamMapFailure(JobEntity job, JobFailRequest request)

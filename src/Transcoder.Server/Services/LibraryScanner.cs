@@ -38,13 +38,29 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
             var root = new DirectoryInfo(library.RootPath);
             var ignoreNames = new HashSet<string>(policy.IgnoreFolderNames, StringComparer.OrdinalIgnoreCase);
             var allowedExtensions = new HashSet<string>(policy.AllowedExtensions, StringComparer.OrdinalIgnoreCase);
+            var seenRelativePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var reconciliationSafe = true;
 
-            foreach (var file in EnumerateFiles(root, ignoreNames, cancellationToken))
+            foreach (var file in EnumerateFiles(
+                         root,
+                         ignoreNames,
+                         path =>
+                         {
+                             reconciliationSafe = false;
+                             logger.LogWarning(
+                                 "Library {LibraryId} could not enumerate {Path}; missing-media reconciliation will be skipped for this scan.",
+                                 library.Id,
+                                 path);
+                         },
+                         cancellationToken))
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
                 if (!allowedExtensions.Contains(file.Extension))
                     continue;
+
+                var relativePath = Path.GetRelativePath(root.FullName, file.FullName).Replace('\\', '/');
+                seenRelativePaths.Add(relativePath);
 
                 library.FilesDiscovered++;
                 var result = await UpsertMediaFileAsync(library, policy, file.FullName, force, createProbeJobs, cancellationToken);
@@ -53,6 +69,25 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
                 if (result.ProbeJobCreated) library.ProbeJobsCreated++;
 
                 await db.SaveChangesAsync(cancellationToken);
+            }
+
+            if (reconciliationSafe)
+            {
+                var missing = await ReconcileMissingMediaAsync(library, seenRelativePaths, cancellationToken);
+                if (missing.MarkedMissing > 0 || missing.CancelledJobs > 0)
+                {
+                    logger.LogInformation(
+                        "Library scan reconciled missing media: Library={LibraryId}; MissingMedia={MissingMedia}; CancelledQueuedJobs={CancelledQueuedJobs}",
+                        library.Id,
+                        missing.MarkedMissing,
+                        missing.CancelledJobs);
+                }
+            }
+            else
+            {
+                logger.LogWarning(
+                    "Library {LibraryId} scan completed with traversal errors; no MediaItem rows were marked Missing.",
+                    library.Id);
             }
 
             library.IsScanning = false;
@@ -83,7 +118,10 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
             return WatchedFileProcessResult.Ignored("File is outside the library root.");
 
         if (!File.Exists(path))
+        {
+            await MarkWatchedFileMissingAsync(libraryId, root, path, cancellationToken);
             return WatchedFileProcessResult.Ignored("File no longer exists.");
+        }
 
         var file = new FileInfo(path);
         if (!new HashSet<string>(policy.AllowedExtensions, StringComparer.OrdinalIgnoreCase).Contains(file.Extension))
@@ -110,7 +148,10 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
         var fileSize = file.Length;
         var lastModifiedUtc = file.LastWriteTimeUtc;
 
-        var existing = await db.MediaItems.FirstOrDefaultAsync(x => x.LibraryId == library.Id && x.RelativePath == relativePath, cancellationToken);
+        // Missing items are hidden by the DbContext query filter, so deliberately bypass it here
+        // to restore the same row (and its history) when a file reappears.
+        var existing = await db.MediaItems.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(x => x.LibraryId == library.Id && x.RelativePath == relativePath, cancellationToken);
         var created = false;
         var updated = false;
         var shouldProbe = force;
@@ -131,8 +172,12 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
             shouldProbe = true;
             await db.SaveChangesAsync(cancellationToken);
         }
-        else if (existing.FileSizeBytes != fileSize || existing.LastModifiedUtc != lastModifiedUtc || force)
+        else if (existing.Status == MediaStatus.Missing
+                 || existing.FileSizeBytes != fileSize
+                 || existing.LastModifiedUtc != lastModifiedUtc
+                 || force)
         {
+            var wasMissing = existing.Status == MediaStatus.Missing;
             existing.FullPath = file.FullName;
             existing.FileSizeBytes = fileSize;
             existing.LastModifiedUtc = lastModifiedUtc;
@@ -141,6 +186,9 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
             existing.UpdatedUtc = DateTime.UtcNow;
             updated = true;
             shouldProbe = true;
+
+            if (wasMissing)
+                logger.LogInformation("Previously missing media restored: MediaItemId={MediaItemId}; Path={Path}", existing.Id, relativePath);
         }
 
         var probeJobCreated = false;
@@ -178,7 +226,89 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
         return new MediaUpsertResult(created, updated, probeJobCreated);
     }
 
-    private IEnumerable<FileInfo> EnumerateFiles(DirectoryInfo root, HashSet<string> ignoreNames, CancellationToken cancellationToken)
+    private async Task<MissingMediaReconciliationResult> ReconcileMissingMediaAsync(
+        LibraryEntity library,
+        HashSet<string> seenRelativePaths,
+        CancellationToken cancellationToken)
+    {
+        var mediaItems = await db.MediaItems.IgnoreQueryFilters()
+            .Where(x => x.LibraryId == library.Id && x.Status != MediaStatus.Missing)
+            .ToListAsync(cancellationToken);
+
+        var missingItems = mediaItems
+            .Where(x => !seenRelativePaths.Contains(x.RelativePath.Replace('\\', '/')))
+            // A policy change can make an existing file no longer enumerable/eligible without
+            // actually deleting it. Only mark the row Missing when the source path is truly gone.
+            .Where(x => !File.Exists(x.FullPath))
+            .ToList();
+
+        if (missingItems.Count == 0)
+            return new MissingMediaReconciliationResult(0, 0);
+
+        var now = DateTime.UtcNow;
+        var missingIds = missingItems.Select(x => x.Id).ToHashSet();
+
+        foreach (var media in missingItems)
+        {
+            media.Status = MediaStatus.Missing;
+            media.UpdatedUtc = now;
+        }
+
+        var queuedJobs = await db.Jobs
+            .Where(x => x.MediaItemId != null
+                        && missingIds.Contains(x.MediaItemId.Value)
+                        && x.Status == JobStatus.Queued)
+            .ToListAsync(cancellationToken);
+
+        foreach (var job in queuedJobs)
+        {
+            job.Status = JobStatus.Cancelled;
+            job.CompletedUtc = now;
+            job.LastError = "Source media is no longer present in the library.";
+            job.LastMessage = "Cancelled by library scan missing-media reconciliation.";
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        return new MissingMediaReconciliationResult(missingItems.Count, queuedJobs.Count);
+    }
+
+    private async Task MarkWatchedFileMissingAsync(int libraryId, string rootPath, string fullPath, CancellationToken cancellationToken)
+    {
+        var relativePath = Path.GetRelativePath(rootPath, fullPath).Replace('\\', '/');
+        var media = await db.MediaItems.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(x => x.LibraryId == libraryId && x.RelativePath == relativePath, cancellationToken);
+
+        if (media is null || media.Status == MediaStatus.Missing)
+            return;
+
+        media.Status = MediaStatus.Missing;
+        media.UpdatedUtc = DateTime.UtcNow;
+
+        var queuedJobs = await db.Jobs
+            .Where(x => x.MediaItemId == media.Id && x.Status == JobStatus.Queued)
+            .ToListAsync(cancellationToken);
+
+        foreach (var job in queuedJobs)
+        {
+            job.Status = JobStatus.Cancelled;
+            job.CompletedUtc = DateTime.UtcNow;
+            job.LastError = "Source media is no longer present in the library.";
+            job.LastMessage = "Cancelled after filesystem watcher detected removal.";
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+        logger.LogInformation(
+            "Filesystem watcher marked media missing: MediaItemId={MediaItemId}; Path={Path}; CancelledQueuedJobs={CancelledQueuedJobs}",
+            media.Id,
+            media.RelativePath,
+            queuedJobs.Count);
+    }
+
+    private IEnumerable<FileInfo> EnumerateFiles(
+        DirectoryInfo root,
+        HashSet<string> ignoreNames,
+        Action<string> onTraversalError,
+        CancellationToken cancellationToken)
     {
         var stack = new Stack<DirectoryInfo>();
         stack.Push(root);
@@ -211,10 +341,12 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
             }
             catch (UnauthorizedAccessException)
             {
+                onTraversalError(directory.FullName);
                 continue;
             }
             catch (IOException)
             {
+                onTraversalError(directory.FullName);
                 continue;
             }
 
@@ -246,6 +378,7 @@ public sealed class LibraryScanner(TranscoderDbContext db, ILogger<LibraryScanne
     }
 
     private sealed record MediaUpsertResult(bool Created, bool Updated, bool ProbeJobCreated);
+    private sealed record MissingMediaReconciliationResult(int MarkedMissing, int CancelledJobs);
 }
 
 public sealed record WatchedFileProcessResult(bool Processed, bool Created, bool Updated, bool ProbeJobCreated, string? IgnoredReason)
