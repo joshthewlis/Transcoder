@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Transcoder.Contracts;
 using Transcoder.Server.Data.Entities;
 
 namespace Transcoder.Server.Data;
@@ -20,6 +21,12 @@ public sealed class TranscoderDbContext(DbContextOptions<TranscoderDbContext> op
     {
         modelBuilder.Entity<LibraryEntity>().HasIndex(x => x.RootPath).IsUnique();
         modelBuilder.Entity<MediaItemEntity>().HasIndex(x => new { x.LibraryId, x.RelativePath }).IsUnique();
+
+        // Missing media remains in the database so completed savings/history are preserved,
+        // but it is excluded from normal application queries. Scanner/reconciliation code uses
+        // IgnoreQueryFilters() when it deliberately needs to see or restore missing rows.
+        modelBuilder.Entity<MediaItemEntity>().HasQueryFilter(x => x.Status != MediaStatus.Missing);
+
         modelBuilder.Entity<MediaPlanHistoryEntity>().HasIndex(x => new { x.MediaItemId, x.Revision }).IsUnique();
         modelBuilder.Entity<MediaPlanHistoryEntity>().HasIndex(x => new { x.MediaItemId, x.IsCurrent });
         modelBuilder.Entity<MediaPlanHistoryEntity>()
