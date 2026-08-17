@@ -6,22 +6,22 @@ public sealed class ServerActivityState
     private ServerActivityOperation? _current;
     private ServerActivityOperation? _last;
 
+    public SemaphoreSlim ReplacementGate { get; } = new(1, 1);
+
     public ServerActivitySnapshot Snapshot()
     {
         lock (_sync)
-        {
-            return new ServerActivitySnapshot(
-                _current?.Clone(),
-                _last?.Clone());
-        }
+            return new ServerActivitySnapshot(_current?.Clone(), _last?.Clone());
     }
 
     public void Start(ServerActivityOperation operation)
     {
         lock (_sync)
         {
-            operation.StartedUtc = DateTime.UtcNow;
-            operation.UpdatedUtc = operation.StartedUtc;
+            var now = DateTime.UtcNow;
+            operation.StartedUtc = now;
+            operation.StageStartedUtc = now;
+            operation.UpdatedUtc = now;
             operation.CompletedUtc = null;
             operation.Success = null;
             _current = operation;
@@ -33,11 +33,21 @@ public sealed class ServerActivityState
         lock (_sync)
         {
             if (_current is null) return;
-            _current.Stage = stage;
+            var now = DateTime.UtcNow;
+            if (!string.Equals(_current.Stage, stage, StringComparison.Ordinal))
+            {
+                _current.Stage = stage;
+                _current.StageStartedUtc = now;
+                _current.BytesProcessed = bytesProcessed;
+                _current.TotalBytes = totalBytes;
+            }
+            else
+            {
+                if (bytesProcessed is not null) _current.BytesProcessed = bytesProcessed;
+                if (totalBytes is not null) _current.TotalBytes = totalBytes;
+            }
             if (message is not null) _current.Message = message;
-            if (bytesProcessed is not null) _current.BytesProcessed = bytesProcessed;
-            if (totalBytes is not null) _current.TotalBytes = totalBytes;
-            _current.UpdatedUtc = DateTime.UtcNow;
+            _current.UpdatedUtc = now;
         }
     }
 
@@ -46,11 +56,12 @@ public sealed class ServerActivityState
         lock (_sync)
         {
             if (_current is null) return;
+            var now = DateTime.UtcNow;
             _current.Success = success;
             _current.Message = message;
             _current.Stage = success ? "Complete" : "Stopped";
-            _current.UpdatedUtc = DateTime.UtcNow;
-            _current.CompletedUtc = _current.UpdatedUtc;
+            _current.UpdatedUtc = now;
+            _current.CompletedUtc = now;
             _last = _current.Clone();
             _current = null;
         }
@@ -62,11 +73,12 @@ public sealed class ServerActivityState
         {
             if (_current is not null)
             {
+                var now = DateTime.UtcNow;
                 _current.Success = false;
                 _current.Message = message;
                 _current.Stage = "Stopped";
-                _current.UpdatedUtc = DateTime.UtcNow;
-                _current.CompletedUtc = _current.UpdatedUtc;
+                _current.UpdatedUtc = now;
+                _current.CompletedUtc = now;
                 _last = _current.Clone();
             }
             _current = null;
@@ -74,9 +86,7 @@ public sealed class ServerActivityState
     }
 }
 
-public sealed record ServerActivitySnapshot(
-    ServerActivityOperation? Current,
-    ServerActivityOperation? Last);
+public sealed record ServerActivitySnapshot(ServerActivityOperation? Current, ServerActivityOperation? Last);
 
 public sealed class ServerActivityOperation
 {
@@ -92,6 +102,7 @@ public sealed class ServerActivityOperation
     public long? BytesProcessed { get; set; }
     public long? TotalBytes { get; set; }
     public DateTime StartedUtc { get; set; }
+    public DateTime StageStartedUtc { get; set; }
     public DateTime UpdatedUtc { get; set; }
     public DateTime? CompletedUtc { get; set; }
     public bool? Success { get; set; }
@@ -110,6 +121,7 @@ public sealed class ServerActivityOperation
         BytesProcessed = BytesProcessed,
         TotalBytes = TotalBytes,
         StartedUtc = StartedUtc,
+        StageStartedUtc = StageStartedUtc,
         UpdatedUtc = UpdatedUtc,
         CompletedUtc = CompletedUtc,
         Success = Success

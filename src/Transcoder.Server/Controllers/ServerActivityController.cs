@@ -29,21 +29,10 @@ public sealed class ServerActivityController(
         var activeHours = ActiveHoursEvaluator.Evaluate(execution, DateTime.UtcNow);
 
         var stagedWaiting = await db.MediaItems.AsNoTracking()
-            .CountAsync(x =>
-                x.Status == MediaStatus.StagedCleaned
-                || x.Status == MediaStatus.Staged
-                || x.Status == MediaStatus.Approved,
-                cancellationToken);
-
+            .CountAsync(x => x.Status == MediaStatus.StagedCleaned || x.Status == MediaStatus.Staged || x.Status == MediaStatus.Approved, cancellationToken);
         var replaceFailures = await db.MediaItems.AsNoTracking()
             .CountAsync(x => x.Status == MediaStatus.ReplaceFailed, cancellationToken);
-
-        var enabledLibraryPolicies = await db.Libraries.AsNoTracking()
-            .Where(x => x.Enabled)
-            .Select(x => x.PolicyJson)
-            .ToListAsync(cancellationToken);
-
-        var replaceEnabledLibraries = enabledLibraryPolicies.Count(LibraryAllowsReplace);
+        var policyJson = await db.Libraries.AsNoTracking().Where(x => x.Enabled).Select(x => x.PolicyJson).ToListAsync(cancellationToken);
 
         return new ServerActivityDto
         {
@@ -53,7 +42,7 @@ public sealed class ServerActivityController(
             AutoReplaceEnabled = mode == ProcessingMode.ReplaceApproved,
             ActiveHoursAllowStagedWork = activeHours.AllowStagedWork,
             ActiveHoursMessage = activeHours.Message,
-            ReplaceEnabledLibraries = replaceEnabledLibraries,
+            ReplaceEnabledLibraries = policyJson.Count(LibraryAllowsReplace),
             StagedWaiting = stagedWaiting,
             ReplaceFailures = replaceFailures,
             Current = ToDto(snapshot.Current),
@@ -63,40 +52,37 @@ public sealed class ServerActivityController(
 
     private static bool LibraryAllowsReplace(string policyJson)
     {
-        try
-        {
-            var policy = JsonSerializer.Deserialize<LibraryPolicyDto>(policyJson, JsonOptions);
-            return policy?.Output?.ReplaceOriginals == true;
-        }
-        catch
-        {
-            return false;
-        }
+        try { return JsonSerializer.Deserialize<LibraryPolicyDto>(policyJson, JsonOptions)?.Output?.ReplaceOriginals == true; }
+        catch { return false; }
     }
 
-    private static ServerActivityOperationDto? ToDto(ServerActivityOperation? operation)
+    private static ServerActivityOperationDto? ToDto(ServerActivityOperation? op)
     {
-        if (operation is null) return null;
+        if (op is null) return null;
+        var now = op.CompletedUtc ?? DateTime.UtcNow;
+        var elapsed = Math.Max(0, (now - op.StartedUtc).TotalSeconds);
+        var stageElapsed = Math.Max(0.001, (now - op.StageStartedUtc).TotalSeconds);
+        double? progress = null, speed = null, eta = null;
 
-        var elapsedEnd = operation.CompletedUtc ?? DateTime.UtcNow;
+        if (op.BytesProcessed is >= 0 && op.TotalBytes is > 0)
+        {
+            progress = Math.Clamp(op.BytesProcessed.Value * 100d / op.TotalBytes.Value, 0, 100);
+            if (op.BytesProcessed.Value > 0)
+            {
+                speed = op.BytesProcessed.Value / stageElapsed;
+                if (speed > 0)
+                    eta = Math.Max(0, (op.TotalBytes.Value - op.BytesProcessed.Value) / speed.Value);
+            }
+        }
+
         return new ServerActivityOperationDto
         {
-            Operation = operation.Operation,
-            MediaId = operation.MediaId,
-            LibraryId = operation.LibraryId,
-            LibraryName = operation.LibraryName,
-            RelativePath = operation.RelativePath,
-            OriginalPath = operation.OriginalPath,
-            StagingPath = operation.StagingPath,
-            Stage = operation.Stage,
-            Message = operation.Message,
-            BytesProcessed = operation.BytesProcessed,
-            TotalBytes = operation.TotalBytes,
-            StartedUtc = operation.StartedUtc,
-            UpdatedUtc = operation.UpdatedUtc,
-            CompletedUtc = operation.CompletedUtc,
-            Success = operation.Success,
-            ElapsedSeconds = Math.Max(0, (elapsedEnd - operation.StartedUtc).TotalSeconds)
+            Operation = op.Operation, MediaId = op.MediaId, LibraryId = op.LibraryId, LibraryName = op.LibraryName,
+            RelativePath = op.RelativePath, OriginalPath = op.OriginalPath, StagingPath = op.StagingPath,
+            Stage = op.Stage, Message = op.Message, BytesProcessed = op.BytesProcessed, TotalBytes = op.TotalBytes,
+            ProgressPercent = progress, BytesPerSecond = speed, EtaSeconds = eta, StartedUtc = op.StartedUtc,
+            StageStartedUtc = op.StageStartedUtc, UpdatedUtc = op.UpdatedUtc, CompletedUtc = op.CompletedUtc,
+            Success = op.Success, ElapsedSeconds = elapsed
         };
     }
 }
@@ -129,7 +115,11 @@ public sealed class ServerActivityOperationDto
     public string? Message { get; set; }
     public long? BytesProcessed { get; set; }
     public long? TotalBytes { get; set; }
+    public double? ProgressPercent { get; set; }
+    public double? BytesPerSecond { get; set; }
+    public double? EtaSeconds { get; set; }
     public DateTime StartedUtc { get; set; }
+    public DateTime StageStartedUtc { get; set; }
     public DateTime UpdatedUtc { get; set; }
     public DateTime? CompletedUtc { get; set; }
     public bool? Success { get; set; }

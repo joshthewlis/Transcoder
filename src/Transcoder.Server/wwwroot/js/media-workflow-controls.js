@@ -205,6 +205,54 @@
   }
 
   // -------------------------
+  // Worker activity layout
+  // -------------------------
+
+  function ensureWorkerActivityLayoutStyle() {
+    if (document.getElementById('worker-activity-layout-style')) return;
+
+    const style = document.createElement('style');
+    style.id = 'worker-activity-layout-style';
+    style.textContent = `
+      .worker-job {
+        display: grid !important;
+        grid-template-columns: max-content minmax(0, 1fr);
+        grid-template-rows: auto auto;
+        align-items: start !important;
+        column-gap: 8px;
+        row-gap: 2px;
+        margin: 3px 0;
+        white-space: normal !important;
+      }
+
+      .worker-job > .status {
+        grid-column: 1;
+        grid-row: 1 / span 2;
+        align-self: start;
+      }
+
+      .worker-job > span:not(.status) {
+        grid-column: 2;
+        grid-row: 1;
+        min-width: 0;
+      }
+
+      .worker-job > small {
+        display: block;
+        grid-column: 2;
+        grid-row: 2;
+        min-width: 0;
+        color: var(--colour-muted);
+        white-space: normal;
+        overflow-wrap: anywhere;
+        line-height: 1.3;
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  // -------------------------
   // Server activity / shutdown visibility
   // -------------------------
 
@@ -310,6 +358,20 @@
     if (op) {
       const media = op.relativePath || (op.mediaId ? `Media ${op.mediaId}` : 'Unknown media');
       const size = op.totalBytes == null ? '' : ` · ${activityFormatBytes(op.totalBytes)}`;
+      const progress = op.progressPercent == null ? null : Math.max(0, Math.min(100, Number(op.progressPercent)));
+      const throughput = op.bytesPerSecond > 0 ? activityFormatBytes(op.bytesPerSecond) + '/s' : '';
+      const eta = op.etaSeconds != null && Number.isFinite(Number(op.etaSeconds))
+        ? activityElapsed(op.etaSeconds)
+        : '';
+      const copied = op.bytesProcessed != null && op.totalBytes != null
+        ? `${activityFormatBytes(op.bytesProcessed)} / ${activityFormatBytes(op.totalBytes)}`
+        : '';
+      const progressLine = progress == null
+        ? ''
+        : `<div style="margin-top:.55rem">
+             <progress max="100" value="${progress.toFixed(1)}" style="width:100%;height:1rem"></progress>
+             <small><strong>${progress.toFixed(1)}%</strong>${copied ? ` · ${copied}` : ''}${throughput ? ` · ${throughput}` : ''}${eta ? ` · ETA ${eta}` : ''}</small>
+           </div>`;
       const paths = [
         op.originalPath ? `<div><small><strong>Original:</strong> ${activityEscape(op.originalPath)}</small></div>` : '',
         op.stagingPath ? `<div><small><strong>Staging:</strong> ${activityEscape(op.stagingPath)}</small></div>` : ''
@@ -322,6 +384,7 @@
           · ${activityEscape(media)}${size}
           · elapsed ${activityElapsed(op.elapsedSeconds)}
           <div>${activityEscape(op.message || '')}</div>
+          ${progressLine}
           ${paths}
         </div>
       `;
@@ -371,6 +434,7 @@
       addMediaButtons();
       addReviewButtons();
       relabelLegacyResetButtons();
+      ensureWorkerActivityLayoutStyle();
       ensureServerActivityPanels();
     } catch { }
   }, 500);
@@ -394,6 +458,7 @@
   window.workflowRepairLimboReviews = repairLimboReviews;
   window.refreshServerActivity = refreshServerActivity;
 
+  ensureWorkerActivityLayoutStyle();
   ensureServerActivityPanels();
   refreshServerActivity().catch(() => {});
 })();
