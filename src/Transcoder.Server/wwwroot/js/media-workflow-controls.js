@@ -24,8 +24,6 @@
     if (typeof refreshReview === 'function') await refreshReview();
   };
 
-  // app.js keeps `state` as a top-level const rather than window.state. Read the visible
-  // selector first so an auto-selected Movies library is also the library used by actions.
   const currentLibraryId = () => {
     const select = document.getElementById('media-browser-library');
     const selected = Number(select?.value || 0);
@@ -64,7 +62,6 @@
         body: JSON.stringify({
           libraryId,
           path: currentPath(),
-          // A cleaned/replaced item is still eligible for a later transcode phase.
           includeFinal: jobType === 'Transcode',
           queueAfterReplan,
           jobType
@@ -143,7 +140,6 @@
     )) return;
 
     try {
-      // Keep the old route for API compatibility; the server no longer performs a destructive reset.
       const result = await workflowApi(`/api/media/${mediaId}/reset-replan`, { method: 'POST' });
       alert(result.message || 'Plan recalculated.');
       await refresh();
@@ -208,19 +204,196 @@
     document.getElementById('workflow-approve-all-reviews')?.addEventListener('click', approveAllReviews);
   }
 
+  // -------------------------
+  // Server activity / shutdown visibility
+  // -------------------------
+
+  const activityFormatBytes = bytes => {
+    if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return 'Unknown';
+    let value = Math.abs(Number(bytes));
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value.toFixed(unit === 0 ? 0 : value >= 100 ? 1 : 2)} ${units[unit]}`;
+  };
+
+  const activityEscape = value => String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+
+  const activityElapsed = seconds => {
+    const total = Math.max(0, Math.floor(Number(seconds || 0)));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const secs = total % 60;
+    return hours > 0
+      ? `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
+      : `${minutes}:${String(secs).padStart(2, '0')}`;
+  };
+
+  function createServerActivityPanel(id, heading) {
+    const panel = document.createElement('section');
+    panel.className = 'panel server-activity-panel';
+    panel.id = id;
+    panel.innerHTML = `
+      <div class="panel-header">
+        <h2>${heading}</h2>
+        <span class="muted">Server-side staging/replacement I/O</span>
+      </div>
+      <div class="card-grid server-activity-summary"></div>
+      <div class="server-activity-detail"></div>
+    `;
+    return panel;
+  }
+
+  function ensureServerActivityPanels() {
+    const dashboard = document.getElementById('page-dashboard');
+    if (dashboard) {
+      const badges = document.getElementById('status-cards');
+      const libraryOverview = document.getElementById('dashboard-library-overview')?.closest('.panel');
+
+      // Requested dashboard order:
+      // badges -> Library Overview -> Server Activity -> Active Jobs -> Finished Jobs.
+      if (badges && libraryOverview && badges.nextElementSibling !== libraryOverview)
+        badges.insertAdjacentElement('afterend', libraryOverview);
+
+      if (!document.getElementById('dashboard-server-activity')) {
+        const panel = createServerActivityPanel('dashboard-server-activity', 'Server Activity');
+        if (libraryOverview)
+          libraryOverview.insertAdjacentElement('afterend', panel);
+        else if (badges)
+          badges.insertAdjacentElement('afterend', panel);
+      }
+    }
+
+    const workersPage = document.getElementById('page-workers');
+    if (workersPage && !document.getElementById('workers-server-activity')) {
+      const workersPanel = document.getElementById('workers-table')?.closest('.panel');
+      const panel = createServerActivityPanel('workers-server-activity', 'Server Activity / Shutdown Safety');
+      if (workersPanel)
+        workersPanel.insertAdjacentElement('beforebegin', panel);
+      else
+        workersPage.appendChild(panel);
+    }
+  }
+
+  function renderServerActivityInto(panel, data) {
+    if (!panel || !data) return;
+    const summary = panel.querySelector('.server-activity-summary');
+    const detail = panel.querySelector('.server-activity-detail');
+
+    const safe = data.safeToStop
+      ? '<span class="status ok">Server I/O idle · safe to stop</span>'
+      : '<span class="status warn">Server I/O active · WAIT</span>';
+
+    const replaceMode = data.autoReplaceEnabled
+      ? '<span class="status ok">Auto Replace enabled</span>'
+      : '<span class="status">Auto Replace off</span>';
+
+    if (summary) {
+      summary.innerHTML = `
+        <div class="card"><div class="card-title">Server I/O</div><div class="card-value">${safe}</div></div>
+        <div class="card"><div class="card-title">Replace Mode</div><div class="card-value">${replaceMode}</div></div>
+        <div class="card"><div class="card-title">Staged Waiting</div><div class="card-value">${Number(data.stagedWaiting || 0)}</div></div>
+        <div class="card"><div class="card-title">Replace Failures</div><div class="card-value">${Number(data.replaceFailures || 0)}</div></div>
+        <div class="card"><div class="card-title">Replace-enabled Libraries</div><div class="card-value">${Number(data.replaceEnabledLibraries || 0)}</div></div>
+      `;
+    }
+
+    const op = data.current;
+    if (op) {
+      const media = op.relativePath || (op.mediaId ? `Media ${op.mediaId}` : 'Unknown media');
+      const size = op.totalBytes == null ? '' : ` · ${activityFormatBytes(op.totalBytes)}`;
+      const paths = [
+        op.originalPath ? `<div><small><strong>Original:</strong> ${activityEscape(op.originalPath)}</small></div>` : '',
+        op.stagingPath ? `<div><small><strong>Staging:</strong> ${activityEscape(op.stagingPath)}</small></div>` : ''
+      ].join('');
+
+      detail.innerHTML = `
+        <div class="mode-warning">
+          <strong>${activityEscape(op.stage || op.operation || 'Server work')}</strong>
+          · ${activityEscape(op.libraryName || '')}
+          · ${activityEscape(media)}${size}
+          · elapsed ${activityElapsed(op.elapsedSeconds)}
+          <div>${activityEscape(op.message || '')}</div>
+          ${paths}
+        </div>
+      `;
+      return;
+    }
+
+    const last = data.last;
+    const lastText = last
+      ? `Last: ${last.success ? 'completed' : 'stopped/skipped'} ${activityEscape(last.relativePath || last.operation || 'server operation')} · ${activityEscape(last.message || '')}`
+      : 'No server-side replacement activity has been recorded since this server process started.';
+
+    detail.innerHTML = `
+      <p class="muted">
+        ${lastText}<br>
+        ${activityEscape(data.activeHoursMessage || '')}
+        ${Number(data.stagedWaiting || 0) > 0 && data.autoReplaceEnabled
+          ? '<br><strong>Note:</strong> staged items are waiting and the server may start replacement on the next auto-replace cycle.'
+          : ''}
+      </p>
+    `;
+  }
+
+  async function refreshServerActivity() {
+    ensureServerActivityPanels();
+
+    const dashboardPanel = document.getElementById('dashboard-server-activity');
+    const workersPanel = document.getElementById('workers-server-activity');
+    if (!dashboardPanel && !workersPanel) return;
+
+    try {
+      const data = await workflowApi('/api/server/activity');
+      renderServerActivityInto(dashboardPanel, data);
+      renderServerActivityInto(workersPanel, data);
+    } catch (error) {
+      const html = `<p class="text-bad">Server activity unavailable: ${activityEscape(error.message || error)}</p>`;
+      dashboardPanel?.querySelector('.server-activity-detail')?.replaceChildren();
+      workersPanel?.querySelector('.server-activity-detail')?.replaceChildren();
+      if (dashboardPanel?.querySelector('.server-activity-detail'))
+        dashboardPanel.querySelector('.server-activity-detail').innerHTML = html;
+      if (workersPanel?.querySelector('.server-activity-detail'))
+        workersPanel.querySelector('.server-activity-detail').innerHTML = html;
+    }
+  }
+
   setInterval(() => {
     try {
       addMediaButtons();
       addReviewButtons();
       relabelLegacyResetButtons();
+      ensureServerActivityPanels();
     } catch { }
   }, 500);
 
-  // Override the legacy app.js action so the old Reset/Replan button cannot perform a reset,
-  // even before the DOM relabel interval has run.
+  // Server activity uses the same rough cadence as the main UI polling.
+  setInterval(() => {
+    refreshServerActivity().catch(() => {});
+  }, 3000);
+
+  window.addEventListener('hashchange', () => {
+    setTimeout(() => {
+      ensureServerActivityPanels();
+      refreshServerActivity().catch(() => {});
+    }, 50);
+  });
+
   window.resetReplanMedia = recalculateMedia;
   window.workflowReplanFolder = recalculateFolder;
   window.workflowQueueFolder = queueFolder;
   window.workflowApproveAllReviews = approveAllReviews;
   window.workflowRepairLimboReviews = repairLimboReviews;
+  window.refreshServerActivity = refreshServerActivity;
+
+  ensureServerActivityPanels();
+  refreshServerActivity().catch(() => {});
 })();

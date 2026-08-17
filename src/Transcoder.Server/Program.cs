@@ -27,6 +27,7 @@ builder.Services.AddHttpClient();
 
 builder.Services.AddSingleton<ScanQueue>();
 builder.Services.AddSingleton<LibraryWatcherState>();
+builder.Services.AddSingleton<ServerActivityState>();
 builder.Services.AddScoped<SystemSettingsService>();
 builder.Services.AddScoped<PathCheckDefinitionService>();
 builder.Services.AddScoped<JobLeaseService>();
