@@ -609,7 +609,7 @@ function renderWorkerActivity(worker) {
         ? ` · media ${job.mediaItemId}`
         : '';
     const title = job.mediaRelativePath ? ` title="${escapeAttribute(job.mediaRelativePath)}"` : '';
-    const message = job.message ? `<small>${escapeHtml(job.message)}</small>` : '';
+    const message = job.message ? `<br /><small>${escapeHtml(job.message)}</small>` : '';
     return `<div class="worker-job"${title}>${badge(job.jobType)} <span>#${job.jobId}${media}${progress}</span>${message}</div>`;
   }).join('');
 }
