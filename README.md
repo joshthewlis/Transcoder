@@ -1,54 +1,22 @@
-# v32 workflow hardening + gaming guard
+# Unsupported subtitle compatibility retry
 
-Files included:
+Replace:
 
-- `src/Transcoder.Server/Controllers/MediaWorkflowController.cs`
-  - bulk replan folder/library
-  - queue folder via server-side logic
-  - repair missing review limbo
-  - approve all reviews
-- `src/Transcoder.Server/wwwroot/js/media-workflow-controls.js`
-  - adds Media Browser buttons:
-    - Replan Current
-    - Replan + Queue Cleanup
-    - Replan + Queue Transcode
-    - Queue Cleanup Fixed
-    - Queue Transcode Fixed
-  - adds Review buttons:
-    - Repair Missing Reviews
-    - Approve All Reviews
-- `src/Transcoder.Server/wwwroot/css/media-workflow-controls.css`
-- `src/Transcoder.Server/wwwroot/index.html`
-  - same as current index with the new script/css tags added
-- `src/Transcoder.Worker/Configuration/WorkerOptions.cs`
-  - adds `GamingGuard` options
-- `src/Transcoder.Worker/Services/WorkerLoopService.cs`
-  - local gaming guard drain mode
+`src/Transcoder.Worker/Services/FfmpegRunner.cs`
 
-## Gaming guard env example
+with the file in this bundle and rebuild/redeploy every Worker.
 
-Add this only on the Bazzite/gaming worker:
+## What it does
 
-```yaml
-Transcoder__GamingGuard__Enabled: "true"
-Transcoder__GamingGuard__PollSeconds: "15"
-Transcoder__GamingGuard__GameRunningSecondsBeforeDrain: "60"
-Transcoder__GamingGuard__NoGameSecondsBeforeResume: "1200"
-```
+If FFmpeg fails at output-header creation because one or more explicitly mapped subtitle streams are reported as `Subtitle: none` / unsupported codec, the worker:
 
-Optional extra detection:
+1. extracts only those unsupported subtitle source indexes from the FFmpeg error,
+2. removes only their exact `-map 0:N` pairs,
+3. deletes the failed partial local output,
+4. retries FFmpeg once,
+5. leaves video and audio mappings unchanged,
+6. logs the omitted subtitle indexes.
 
-```yaml
-Transcoder__GamingGuard__ProcessNames__0: "lego"
-Transcoder__GamingGuard__ProcessNames__1: "retroarch"
-Transcoder__GamingGuard__CommandLineContains__0: "/steamapps/common/"
-Transcoder__GamingGuard__CommandLineContains__1: "SteamGameId="
-```
+This is intentionally a worker-side fallback so already queued jobs with old plan payloads can succeed without replanning.
 
-Or use a custom command. Exit code `0` means game detected:
-
-```yaml
-Transcoder__GamingGuard__DetectionCommand: "pgrep -fa '/steamapps/common/' >/dev/null"
-```
-
-When a game is detected for 60s, the worker stops advertising capacity and stops leasing new jobs. Existing jobs continue until they finish. After 20 minutes with no game detected, the worker starts leasing again.
+It does not drop unknown video/audio streams and it does not retry arbitrary FFmpeg failures.

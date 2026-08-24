@@ -24,6 +24,85 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         if (plannedArgs.Count == 0)
             throw new InvalidOperationException("FFmpeg plan contains no arguments.");
 
+        var effectiveArgs = plannedArgs.ToList();
+        var firstRun = await RunProcessAsync(
+            effectiveArgs,
+            inputPath,
+            outputPath,
+            progress,
+            cancellationToken,
+            inputDurationSeconds);
+
+        if (firstRun.ExitCode == 0)
+            return firstRun;
+
+        var firstFailureLog = Tail(firstRun.LogText, MaxFailureLogCharacters);
+
+        if (TryBuildUnsupportedSubtitleRetryArgs(
+                effectiveArgs,
+                firstFailureLog,
+                out var retryArgs,
+                out var omittedSubtitleIndexes))
+        {
+            logger.LogWarning(
+                "ffmpeg failed because mapped subtitle streams are unsupported/unknown. Retrying once without source subtitle stream(s) [{StreamIndexes}]. Video and audio mappings are unchanged.",
+                string.Join(",", omittedSubtitleIndexes));
+
+            progress?.Invoke(
+                1,
+                $"Retrying ffmpeg without unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)}");
+
+            TryDeleteOutput(outputPath);
+
+            var retryRun = await RunProcessAsync(
+                retryArgs,
+                inputPath,
+                outputPath,
+                progress,
+                cancellationToken,
+                inputDurationSeconds);
+
+            if (retryRun.ExitCode == 0)
+            {
+                logger.LogWarning(
+                    "ffmpeg compatibility retry succeeded after omitting unsupported subtitle stream(s) [{StreamIndexes}].",
+                    string.Join(",", omittedSubtitleIndexes));
+
+                return new FfmpegRunResult(
+                    retryRun.ExitCode,
+                    firstRun.Elapsed + retryRun.Elapsed,
+                    firstRun.LogText
+                    + Environment.NewLine
+                    + $"--- Transcoder compatibility retry: omitted unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)} ---"
+                    + Environment.NewLine
+                    + retryRun.LogText);
+            }
+
+            var retryFailureLog = Tail(retryRun.LogText, MaxFailureLogCharacters);
+            logger.LogWarning(
+                "ffmpeg compatibility retry failed with exit code {ExitCode}: {Log}",
+                retryRun.ExitCode,
+                retryFailureLog);
+
+            throw CreateFfmpegException(retryRun.ExitCode, retryFailureLog);
+        }
+
+        logger.LogWarning(
+            "ffmpeg failed with exit code {ExitCode}: {Log}",
+            firstRun.ExitCode,
+            firstFailureLog);
+
+        throw CreateFfmpegException(firstRun.ExitCode, firstFailureLog);
+    }
+
+    private async Task<FfmpegRunResult> RunProcessAsync(
+        IReadOnlyList<string> args,
+        string inputPath,
+        string outputPath,
+        Action<double?, string>? progress,
+        CancellationToken cancellationToken,
+        double? inputDurationSeconds)
+    {
         var outputDirectory = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrWhiteSpace(outputDirectory))
             Directory.CreateDirectory(outputDirectory);
@@ -36,7 +115,7 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
             UseShellExecute = false
         };
 
-        foreach (var arg in plannedArgs)
+        foreach (var arg in args)
         {
             startInfo.ArgumentList.Add(arg switch
             {
@@ -76,20 +155,120 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         var elapsed = DateTime.UtcNow - started;
         var logText = log.ToString();
 
-        if (process.ExitCode != 0)
+        if (process.ExitCode == 0)
+            progress?.Invoke(95, "ffmpeg complete");
+
+        return new FfmpegRunResult(process.ExitCode, elapsed, logText);
+    }
+
+    private static FfmpegException CreateFfmpegException(int exitCode, string failureLog)
+    {
+        var errorCode = IsInvalidStreamMapFailure(failureLog)
+            ? FfmpegErrorCodes.InvalidStreamMap
+            : FfmpegErrorCodes.FfmpegFailed;
+
+        return new FfmpegException(errorCode, exitCode, failureLog);
+    }
+
+    private static bool TryBuildUnsupportedSubtitleRetryArgs(
+        IReadOnlyList<string> currentArgs,
+        string failureLog,
+        out List<string> retryArgs,
+        out List<int> omittedSubtitleIndexes)
+    {
+        retryArgs = [];
+        omittedSubtitleIndexes = [];
+
+        if (!LooksLikeUnsupportedSubtitleFailure(failureLog))
+            return false;
+
+        var indexes = new HashSet<int>();
+
+        foreach (Match match in Regex.Matches(
+                     failureLog,
+                     @"Could not find codec parameters for stream\s+(?<index>\d+)\s+\(Subtitle:\s*none\)",
+                     RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
         {
-            var failureLog = Tail(logText, MaxFailureLogCharacters);
-            logger.LogWarning("ffmpeg failed with exit code {ExitCode}: {Log}", process.ExitCode, failureLog);
-
-            var errorCode = IsInvalidStreamMapFailure(failureLog)
-                ? FfmpegErrorCodes.InvalidStreamMap
-                : FfmpegErrorCodes.FfmpegFailed;
-
-            throw new FfmpegException(errorCode, process.ExitCode, failureLog);
+            if (int.TryParse(match.Groups["index"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+                indexes.Add(index);
         }
 
-        progress?.Invoke(95, "ffmpeg complete");
-        return new FfmpegRunResult(process.ExitCode, elapsed, logText);
+        foreach (Match match in Regex.Matches(
+                     failureLog,
+                     @"Stream\s+#0:(?<index>\d+)(?:\([^)]+\))?:\s*Subtitle:\s*none",
+                     RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        {
+            if (int.TryParse(match.Groups["index"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index))
+                indexes.Add(index);
+        }
+
+        if (indexes.Count == 0)
+            return false;
+
+        var removed = new HashSet<int>();
+        for (var i = 0; i < currentArgs.Count; i++)
+        {
+            if (currentArgs[i].Equals("-map", StringComparison.OrdinalIgnoreCase)
+                && i + 1 < currentArgs.Count
+                && TryParseExplicitInputStreamMap(currentArgs[i + 1], out var streamIndex)
+                && indexes.Contains(streamIndex))
+            {
+                removed.Add(streamIndex);
+                i++;
+                continue;
+            }
+
+            retryArgs.Add(currentArgs[i]);
+        }
+
+        if (removed.Count == 0)
+            return false;
+
+        omittedSubtitleIndexes = removed.OrderBy(x => x).ToList();
+        return true;
+    }
+
+    private static bool LooksLikeUnsupportedSubtitleFailure(string logText)
+    {
+        var hasUnsupportedCodec =
+            logText.Contains("Unknown/unsupported AVCodecID", StringComparison.OrdinalIgnoreCase)
+            || logText.Contains("Subtitle codec 0 is not supported", StringComparison.OrdinalIgnoreCase)
+            || logText.Contains("Subtitle: none", StringComparison.OrdinalIgnoreCase);
+
+        var headerFailed =
+            logText.Contains("Could not write header", StringComparison.OrdinalIgnoreCase)
+            || logText.Contains("Error opening output", StringComparison.OrdinalIgnoreCase);
+
+        return hasUnsupportedCodec && headerFailed;
+    }
+
+    private static bool TryParseExplicitInputStreamMap(string value, out int streamIndex)
+    {
+        streamIndex = -1;
+        var match = Regex.Match(
+            value.Trim(),
+            @"^0:(?<index>\d+)$",
+            RegexOptions.CultureInvariant);
+
+        return match.Success
+            && int.TryParse(
+                match.Groups["index"].Value,
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out streamIndex);
+    }
+
+    private static void TryDeleteOutput(string outputPath)
+    {
+        try
+        {
+            if (File.Exists(outputPath))
+                File.Delete(outputPath);
+        }
+        catch
+        {
+            // The retry will produce the normal ffmpeg failure if the stale output cannot be replaced.
+        }
     }
 
     private static bool IsInvalidStreamMapFailure(string logText)
