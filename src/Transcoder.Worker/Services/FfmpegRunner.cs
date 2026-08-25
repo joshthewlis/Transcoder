@@ -24,75 +24,74 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         if (plannedArgs.Count == 0)
             throw new InvalidOperationException("FFmpeg plan contains no arguments.");
 
-        var effectiveArgs = plannedArgs.ToList();
-        var firstRun = await RunProcessAsync(
-            effectiveArgs,
-            inputPath,
-            outputPath,
-            progress,
-            cancellationToken,
-            inputDurationSeconds);
+        var currentArgs = plannedArgs.ToList();
+        var combinedLog = new StringBuilder();
+        var totalElapsed = TimeSpan.Zero;
 
-        if (firstRun.ExitCode == 0)
-            return firstRun;
+        var run = await RunProcessAsync(currentArgs, inputPath, outputPath, progress, cancellationToken, inputDurationSeconds);
+        totalElapsed += run.Elapsed;
+        combinedLog.Append(run.LogText);
 
-        var firstFailureLog = Tail(firstRun.LogText, MaxFailureLogCharacters);
+        if (run.ExitCode == 0)
+            return run;
 
-        if (TryBuildUnsupportedSubtitleRetryArgs(
-                effectiveArgs,
-                firstFailureLog,
-                out var retryArgs,
-                out var omittedSubtitleIndexes))
+        var failureLog = Tail(run.LogText, MaxFailureLogCharacters);
+
+        if (TryBuildUnsupportedSubtitleRetryArgs(currentArgs, failureLog, out var subtitleRetryArgs, out var omittedSubtitleIndexes))
         {
             logger.LogWarning(
                 "ffmpeg failed because mapped subtitle streams are unsupported/unknown. Retrying once without source subtitle stream(s) [{StreamIndexes}]. Video and audio mappings are unchanged.",
                 string.Join(",", omittedSubtitleIndexes));
 
-            progress?.Invoke(
-                1,
-                $"Retrying ffmpeg without unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)}");
-
+            progress?.Invoke(1, $"Retrying ffmpeg without unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)}");
             TryDeleteOutput(outputPath);
 
-            var retryRun = await RunProcessAsync(
-                retryArgs,
-                inputPath,
-                outputPath,
-                progress,
-                cancellationToken,
-                inputDurationSeconds);
+            run = await RunProcessAsync(subtitleRetryArgs, inputPath, outputPath, progress, cancellationToken, inputDurationSeconds);
+            totalElapsed += run.Elapsed;
+            combinedLog.AppendLine();
+            combinedLog.AppendLine($"--- Transcoder compatibility retry: omitted unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)} ---");
+            combinedLog.Append(run.LogText);
 
-            if (retryRun.ExitCode == 0)
+            if (run.ExitCode == 0)
             {
                 logger.LogWarning(
                     "ffmpeg compatibility retry succeeded after omitting unsupported subtitle stream(s) [{StreamIndexes}].",
                     string.Join(",", omittedSubtitleIndexes));
-
-                return new FfmpegRunResult(
-                    retryRun.ExitCode,
-                    firstRun.Elapsed + retryRun.Elapsed,
-                    firstRun.LogText
-                    + Environment.NewLine
-                    + $"--- Transcoder compatibility retry: omitted unsupported subtitle stream(s) {string.Join(",", omittedSubtitleIndexes)} ---"
-                    + Environment.NewLine
-                    + retryRun.LogText);
+                return new FfmpegRunResult(0, totalElapsed, combinedLog.ToString());
             }
 
-            var retryFailureLog = Tail(retryRun.LogText, MaxFailureLogCharacters);
-            logger.LogWarning(
-                "ffmpeg compatibility retry failed with exit code {ExitCode}: {Log}",
-                retryRun.ExitCode,
-                retryFailureLog);
-
-            throw CreateFfmpegException(retryRun.ExitCode, retryFailureLog);
+            currentArgs = subtitleRetryArgs;
+            failureLog = Tail(run.LogText, MaxFailureLogCharacters);
         }
 
-        logger.LogWarning(
-            "ffmpeg failed with exit code {ExitCode}: {Log}",
-            firstRun.ExitCode,
-            firstFailureLog);
+        if (TryBuildM4vHevcMuxerRetryArgs(currentArgs, outputPath, failureLog, out var m4vRetryArgs))
+        {
+            logger.LogWarning(
+                "ffmpeg selected the M4V/iPod muxer for {OutputPath}, which rejected HEVC. Retrying once with the MP4 muxer while retaining the .m4v filename.",
+                outputPath);
 
-        throw CreateFfmpegException(firstRun.ExitCode, firstFailureLog);
+            progress?.Invoke(1, "Retrying HEVC .m4v output using MP4 muxer");
+            TryDeleteOutput(outputPath);
+
+            run = await RunProcessAsync(m4vRetryArgs, inputPath, outputPath, progress, cancellationToken, inputDurationSeconds);
+            totalElapsed += run.Elapsed;
+            combinedLog.AppendLine();
+            combinedLog.AppendLine("--- Transcoder compatibility retry: forced MP4 muxer for HEVC .m4v output ---");
+            combinedLog.Append(run.LogText);
+
+            if (run.ExitCode == 0)
+            {
+                logger.LogWarning(
+                    "ffmpeg compatibility retry succeeded using MP4 muxer for HEVC .m4v output {OutputPath}.",
+                    outputPath);
+                return new FfmpegRunResult(0, totalElapsed, combinedLog.ToString());
+            }
+
+            failureLog = Tail(run.LogText, MaxFailureLogCharacters);
+        }
+
+        logger.LogWarning("ffmpeg failed with exit code {ExitCode}: {Log}", run.ExitCode, failureLog);
+        throw CreateFfmpegException(run.ExitCode, failureLog);
     }
 
     private async Task<FfmpegRunResult> RunProcessAsync(
@@ -166,7 +165,6 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         var errorCode = IsInvalidStreamMapFailure(failureLog)
             ? FfmpegErrorCodes.InvalidStreamMap
             : FfmpegErrorCodes.FfmpegFailed;
-
         return new FfmpegException(errorCode, exitCode, failureLog);
     }
 
@@ -217,7 +215,6 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
                 i++;
                 continue;
             }
-
             retryArgs.Add(currentArgs[i]);
         }
 
@@ -225,6 +222,38 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
             return false;
 
         omittedSubtitleIndexes = removed.OrderBy(x => x).ToList();
+        return true;
+    }
+
+    private static bool TryBuildM4vHevcMuxerRetryArgs(
+        IReadOnlyList<string> currentArgs,
+        string outputPath,
+        string failureLog,
+        out List<string> retryArgs)
+    {
+        retryArgs = [];
+
+        if (!Path.GetExtension(outputPath).Equals(".m4v", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var muxerRejectedHevc =
+            failureLog.Contains("Could not find tag for codec hevc", StringComparison.OrdinalIgnoreCase)
+            && failureLog.Contains("codec not currently supported in container", StringComparison.OrdinalIgnoreCase)
+            && failureLog.Contains("Could not write header", StringComparison.OrdinalIgnoreCase);
+
+        if (!muxerRejectedHevc)
+            return false;
+
+        retryArgs = currentArgs.ToList();
+        var outputIndex = retryArgs.FindLastIndex(x => x.Equals("{output}", StringComparison.Ordinal));
+        if (outputIndex < 0)
+            return false;
+
+        if (retryArgs.Take(outputIndex).Any(x => x.Equals("-f", StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        retryArgs.Insert(outputIndex, "mp4");
+        retryArgs.Insert(outputIndex, "-f");
         return true;
     }
 
@@ -245,17 +274,9 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
     private static bool TryParseExplicitInputStreamMap(string value, out int streamIndex)
     {
         streamIndex = -1;
-        var match = Regex.Match(
-            value.Trim(),
-            @"^0:(?<index>\d+)$",
-            RegexOptions.CultureInvariant);
-
+        var match = Regex.Match(value.Trim(), @"^0:(?<index>\d+)$", RegexOptions.CultureInvariant);
         return match.Success
-            && int.TryParse(
-                match.Groups["index"].Value,
-                NumberStyles.Integer,
-                CultureInfo.InvariantCulture,
-                out streamIndex);
+            && int.TryParse(match.Groups["index"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out streamIndex);
     }
 
     private static void TryDeleteOutput(string outputPath)
@@ -267,7 +288,7 @@ public sealed class FfmpegRunner(IOptions<WorkerOptions> options, ILogger<Ffmpeg
         }
         catch
         {
-            // The retry will produce the normal ffmpeg failure if the stale output cannot be replaced.
+            // Best effort only.
         }
     }
 
